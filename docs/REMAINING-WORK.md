@@ -27,11 +27,11 @@
 
 ## 三、开源准备
 
-1. 许可证三选一：MIT / Apache-2.0 / GPL-3.0（之前倾向 Apache-2.0 或 MIT）；确定后创建 `LICENSE`。
-2. 干净仓库：新建独立 GitHub 仓库，不要把当前文件夹直接推上去；确认 `.gitignore` 覆盖 `data/`、`.electron-data/`、`downloads/`、`release/`、`node_modules/` 及任何截图。
-3. README：项目定位、功能截图、使用方法、隐私与版权声明（不包含平台访问细节、Cookie 或授权地址）。
-4. 社区文件：`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`、`SECURITY.md`。
-5. GitHub Actions：push 时自动跑 `check` + `test` + `build`，可选自动出包。
+1. [x] Apache-2.0 许可证、`NOTICE` 与非官方合规声明。
+2. [x] 独立干净仓库：`https://github.com/run4u/smartedu-textbook-library`。
+3. [x] README：项目定位、源码运行、隐私、版权和许可证边界。
+4. [x] 社区文件：`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`、`SECURITY.md`、Issue/PR 模板。
+5. [x] GitHub Actions：push/PR 自动运行 `npm ci`、`test`、`check`、`build`，Ubuntu CI 已通过。
 
 ## 四、已确认搁置或待定
 

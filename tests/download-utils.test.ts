@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import path from 'node:path';
 import { filename, outputPaths, validatePdf } from '../electron/download-utils.cjs';
 
 const resource = {
@@ -25,9 +26,10 @@ describe('filename', () => {
 
 describe('outputPaths', () => {
   it('places files under the SmartEdu Textbook Library directory with a .part sibling', () => {
-    const paths = outputPaths(resource, 'C:\\downloads');
-    expect(paths.directory).toBe('C:\\downloads\\SmartEdu Textbook Library');
-    expect(paths.target).toBe('C:\\downloads\\SmartEdu Textbook Library\\高中_数学_高中年级_必修 第一册_人教版（B版）_2026年度_abcdefgh.pdf');
+    const downloadsPath = path.join('test-root', 'downloads');
+    const paths = outputPaths(resource, downloadsPath);
+    expect(paths.directory).toBe(path.join(downloadsPath, 'SmartEdu Textbook Library'));
+    expect(paths.target).toBe(path.join(paths.directory, '高中_数学_高中年级_必修 第一册_人教版（B版）_2026年度_abcdefgh.pdf'));
     expect(paths.part).toBe(`${paths.target}.part`);
   });
 });

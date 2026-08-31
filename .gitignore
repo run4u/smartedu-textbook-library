@@ -1,0 +1,15 @@
+node_modules/
+dist/
+release/
+.vite/
+*.log
+*.tsbuildinfo
+ui-check.png
+
+# Personal application data, browser sessions, credentials, logs and downloads.
+app-data/
+.electron-data/
+downloads/
+*.part
+*.tmp
+ui-*.png

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, session, shell } = require('electron');
 const path = require('node:path');
 const { loadCatalog } = require('./catalog.cjs');
 const { DownloadQueue } = require('./queue.cjs');
@@ -82,6 +82,7 @@ function broadcast(channel, payload) {
 }
 
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
   const queue = new DownloadQueue({
     downloadsPath: app.getPath('downloads'),
     dataPath: app.getPath('userData'),

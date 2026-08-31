@@ -45,8 +45,8 @@
 
 ## 安装包冒烟测试（本轮新增）
 
-1. 运行 `smartedu-library-desktop/release/SmartEdu Textbook Library Setup 0.1.0.exe`，按向导完成安装并启动，确认窗口和教材目录正常。
-2. 运行 `smartedu-library-desktop/release/SmartEdu Textbook Library 0.1.0.exe`，确认便携版无需安装即可启动。
+1. 运行当前版本的 `release/SmartEdu Textbook Library Setup <version>.exe`，按向导完成安装并启动，确认窗口和教材目录正常。
+2. 运行当前版本的 `release/SmartEdu Textbook Library <version>.exe`，确认便携版无需安装即可启动。
 3. 在打包版中重新登录平台，下载一个小文件，确认解析、进度、校验、完成状态和本地资料页均正常。
 4. 确认打包版的数据目录与开发版 `.electron-data` 隔离，不会读取开发期的登录档案或下载记录。
 
@@ -60,7 +60,7 @@
 
 ## 自动化测试（已实现）
 
-- 运行 `npm test`（Vitest，25 项）。
+- 运行 `npm test`（Vitest，当前 27 项）。
 - `tests/catalog-normalize.test.ts`：目录字段标准化与标题推断。
 - `tests/catalog-logic.test.ts`：多关键词匹配、筛选收窄、分类聚合、选择与跳过已下载逻辑。
 - `tests/download-utils.test.ts`：文件命名、路径布局、PDF 头与大小校验。

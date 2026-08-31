@@ -2,7 +2,7 @@
 
 ## 发布前必须具备
 
-- `LICENSE`：由维护者选择许可证后加入。尚未选定前，不应声称项目已经以某种许可证开源。
+- `LICENSE`：当前项目采用 Apache-2.0，并在仓库根目录提供 `LICENSE` 与 `NOTICE`。
 - `CONTRIBUTING.md`：开发环境、分支/提交要求、测试要求、提交 issue 和 pull request 的方式。
 - `CODE_OF_CONDUCT.md`：协作行为准则。
 - `SECURITY.md`：私密漏洞的报告渠道；禁止在公开 issue 中提交账号、Cookie、Token、签名 URL 或教材文件。

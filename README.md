@@ -35,7 +35,9 @@ Downloads are first written to `.part` files. Before completion, the application
 
 The development build supports the complete catalog, sign-in, download queue, and local-library workflow described above. Windows NSIS installer and portable builds can be produced locally, but they are unsigned and still need the remaining manual acceptance checks documented in [Testing Guide](docs/TESTING.md).
 
-There is currently no published GitHub Release or officially distributed binary. Build from source for development and evaluation.
+Windows x64 installer and portable packages are available from [GitHub Releases](https://github.com/run4u/smartedu-textbook-library/releases/tag/v0.1.2). Version `0.1.2` is published as a pre-release because the packages are not code-signed and some display and extended acceptance scenarios remain to be refined.
+
+Windows SmartScreen may show an “Unknown publisher” warning. Verify the SHA-256 checksums attached to the release before running a downloaded package. macOS binaries are not currently provided because the project has not yet completed macOS hardware testing, Apple signing, or notarization.
 
 ## Development
 

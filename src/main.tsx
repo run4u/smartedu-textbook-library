@@ -417,11 +417,19 @@ function SettingsPage({ settings, catalog, message, hasSavedSession, onUpdate, o
   if (!settings) return <p className="empty-hint">正在加载设置…</p>;
   const fields: Array<[keyof AppSettings['defaultFilters'], string]> = [['stage', '学段'], ['subject', '学科'], ['grade', '年级'], ['volume', '册次'], ['edition', '版本']];
   const options = computeFilterOptions(catalog, settings.defaultFilters);
+  const filenamePresets = [
+    { id: 'detailed', name: '分类详细', description: '信息最完整，适合长期归档', template: '{学段}_{学科}_{年级}_{册次}_{版本}_{年度}_{短ID}' },
+    { id: 'title', name: '教材标题', description: '优先使用官方教材名称', template: '{教材名称}_{年度}_{短ID}' },
+    { id: 'compact', name: '简洁格式', description: '文件名较短，仍能区分资源', template: '{学科}_{年级}_{册次}_{年度}_{短ID}' },
+  ];
+  const selectedPreset = filenamePresets.find((preset) => preset.template === settings.filenameTemplate)?.id || 'custom';
+  const templateTokens = ['{教材名称}', '{学段}', '{学科}', '{年级}', '{册次}', '{版本}', '{年度}', '{短ID}'];
+  const insertToken = (token: string) => onUpdate({ filenameTemplate: `${settings.filenameTemplate}${settings.filenameTemplate && !settings.filenameTemplate.endsWith('_') ? '_' : ''}${token}` });
   return <section className="settings-page">
     {message && <div className="batch-notice">{message}</div>}
     <div className="settings-card"><div className="settings-card-head"><div><h2>下载设置</h2><p>新下载任务会使用这里保存的目录和文件名格式。</p></div></div>
       <div className="settings-row"><div><strong>下载目录</strong><span className="settings-help">当前：{settings.effectiveDownloadDirectory}</span></div><div className="settings-actions"><button className="button secondary small" onClick={onChooseDirectory}>选择目录</button><button className="button secondary small" onClick={onResetDirectory}>恢复默认</button><button className="button secondary small" onClick={onOpenDirectory}>打开目录</button></div></div>
-      <div className="settings-row settings-column"><div><strong>文件名格式</strong><span className="settings-help">支持：{'{教材名称}'}、{'{学段}'}、{'{学科}'}、{'{年级}'}、{'{册次}'}、{'{版本}'}、{'{年度}'}、{'{资源ID}'}、{'{短ID}'}</span></div><input className="settings-input" value={settings.filenameTemplate} onChange={(event) => onUpdate({ filenameTemplate: event.target.value })} /><span className="settings-preview">预览：{previewFilename(settings.filenameTemplate)}.pdf（未包含资源 ID 时会自动追加短 ID）</span></div>
+      <div className="settings-row settings-column"><div><strong>文件名格式</strong><span className="settings-help">选择一种常用格式即可；只有特殊需求才需要使用高级自定义。</span></div><div className="filename-presets">{filenamePresets.map((preset) => <button type="button" key={preset.id} className={`filename-preset ${selectedPreset === preset.id ? 'active' : ''}`} onClick={() => onUpdate({ filenameTemplate: preset.template })}><strong>{preset.name}</strong><span>{preset.description}</span><code>{previewFilename(preset.template)}.pdf</code></button>)}</div><span className="settings-preview">当前预览：{previewFilename(settings.filenameTemplate)}.pdf</span><details className="advanced-settings" open={selectedPreset === 'custom'}><summary>高级自定义</summary><p className="settings-help">点击字段即可加入模板，也可以直接编辑。未包含资源 ID 时，程序会自动追加短 ID防止重名。</p><div className="template-tokens">{templateTokens.map((token) => <button type="button" key={token} onClick={() => insertToken(token)}>{token}</button>)}</div><input className="settings-input" value={settings.filenameTemplate} onChange={(event) => onUpdate({ filenameTemplate: event.target.value })} /></details></div>
       <label className="settings-check"><input type="checkbox" checked={settings.downloadNotifications} onChange={(event) => onUpdate({ downloadNotifications: event.target.checked })} />下载任务结束时发送系统通知</label>
     </div>
     <div className="settings-card"><div className="settings-card-head"><div><h2>启动偏好</h2><p>选择每次启动时使用固定默认值，或恢复上次使用的筛选条件。</p></div></div>

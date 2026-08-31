@@ -1,5 +1,7 @@
 # SmartEdu Textbook Library
 
+中文说明：[README.zh-CN.md](README.zh-CN.md)
+
 SmartEdu Textbook Library is a local-first desktop application for finding, distinguishing, and saving textbook resources that a user can access through their own SmartEdu session.
 
 > **Unofficial project:** This independent personal-research tool is not affiliated with or endorsed by the Smart Education platform or any textbook rights holder. It does not host textbooks, provide public download links, or bypass authentication and access controls. Users and redistributors are responsible for complying with copyright law and platform terms.
@@ -25,7 +27,7 @@ npm install
 npm run dev
 ```
 
-For Windows development, keep the terminal window open while the app is running. The repository-root launcher `启动新版桌面端.cmd` starts the desktop development build. Do not commit `.electron-data`, downloaded files, or `.part` files.
+For Windows development, keep the terminal window open while the app is running. The repository-root launcher `启动桌面端.cmd` starts the desktop development build. Do not commit `.electron-data`, downloaded files, or `.part` files.
 
 On macOS or Linux, run `npm ci` and `npm run dev` from a terminal. Packaged releases are currently Windows-only; source-mode behavior on macOS still requires community testing.
 

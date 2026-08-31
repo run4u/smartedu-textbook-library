@@ -18,12 +18,13 @@ This repository contains source code and project documentation only. It must not
 - Run single or sequential batch downloads with resolution, progress, validation, failure details, and task history.
 - Pause, resume, cancel, retry failed tasks, continue partial downloads, and clean up `.part` files.
 - Browse a persisted local library, filter by keyword or subject, open a textbook, and reveal it in the system file manager.
+- Change the download directory, customize filename templates, configure startup filters and the default page, and manage task or session records from the Settings page.
 
 ## Resource And File Rules
 
 `contentId` is the unique identity of a resource. A title is not an identity, and resources are never merged or skipped automatically just because their titles match. Resources with different years, sizes, contents, or IDs remain independently selectable and downloadable.
 
-Downloaded files are saved under the system Downloads directory in `SmartEdu Textbook Library`. Filenames contain the classification, resource year, and a short resource ID, for example:
+Downloaded files are saved under the system Downloads directory in `SmartEdu Textbook Library` by default, and a different directory can be selected in Settings. Default filenames contain the classification, resource year, and a short resource ID, for example:
 
 ```text
 初中_英语_七年级_上册_北师大版_2026年度_f4a32947.pdf

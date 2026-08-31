@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { CheckCircle2, Download, FileText, FolderOpen, LoaderCircle, LogIn, LogOut, PanelLeftClose, PanelLeftOpen, Pause, Play, RefreshCw, Search, Trash2, X } from 'lucide-react';
+import { CheckCircle2, Download, FileText, FolderOpen, LoaderCircle, LogIn, LogOut, PanelLeftClose, PanelLeftOpen, Pause, Play, RefreshCw, Search, Settings, Trash2, X } from 'lucide-react';
 import { resources, type TextbookResource } from './data/fixtures';
 import { computeFilterOptions, filterFields, filterResources, groupResources, getSelectableResources, toggleAllSelection, toggleSkipDownloaded } from './lib/catalog';
 import './styles.css';
@@ -20,6 +20,17 @@ function formatDuration(milliseconds?: number | null): string {
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
   return hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}` : `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function previewFilename(template: string): string {
+  const sample = { title: '英语七年级上册', stage: '初中', subject: '英语', grade: '七年级', volume: '上册', edition: '北师大版', year: '2026年度', shortId: 'f4a32947' };
+  const sourceTemplate = template || '{学段}_{学科}_{年级}_{册次}_{版本}_{年度}_{短ID}';
+  let rendered = sourceTemplate
+    .replaceAll('{教材名称}', sample.title).replaceAll('{学段}', sample.stage).replaceAll('{学科}', sample.subject).replaceAll('{年级}', sample.grade).replaceAll('{册次}', sample.volume).replaceAll('{版本}', sample.edition).replaceAll('{年度}', sample.year).replaceAll('{资源ID}', 'f4a32947-1234-5678-90ab-cdef01234567').replaceAll('{短ID}', sample.shortId)
+    .replace(/\{[^{}]+\}/g, '').replace(/[\\/:*?"<>|]/g, '_').replace(/[. ]+$/g, '').trim() || '教材_f4a32947';
+  rendered = rendered.replace(/\.pdf$/i, '');
+  if (!sourceTemplate.includes('{短ID}') && !sourceTemplate.includes('{资源ID}')) rendered = `${rendered}_${sample.shortId}`;
+  return rendered;
 }
 
 type TaskStatus = 'queued' | 'running' | 'paused' | 'complete' | 'error' | 'canceled';
@@ -58,8 +69,23 @@ type LibraryItem = {
   completedAt: string;
   exists: boolean;
 };
+type AppView = 'catalog' | 'tasks' | 'library' | 'settings';
+type AppSettings = {
+  downloadDirectory: string;
+  effectiveDownloadDirectory: string;
+  defaultDownloadDirectory: string;
+  filenameTemplate: string;
+  startupFilterMode: 'defaults' | 'last';
+  defaultFilters: { stage: string; subject: string; grade: string; volume: string; edition: string };
+  lastFilters: { stage: string; subject: string; grade: string; volume: string; edition: string };
+  defaultSkipDownloaded: boolean;
+  lastSkipDownloaded: boolean;
+  defaultView: AppView;
+  downloadNotifications: boolean;
+};
 
 type TextbookBridge = {
+  appVersion?: string;
   loadCatalog?: () => Promise<{ resources: TextbookResource[]; source: string }>;
   getSessionStatus?: () => Promise<{ hasSavedSession: boolean }>;
   login?: () => Promise<{ hasSavedSession: boolean; autoClosed?: boolean }>;
@@ -76,6 +102,12 @@ type TextbookBridge = {
   listLibrary?: () => Promise<LibraryItem[]>;
   openLibraryFile?: (filePath: string) => Promise<string>;
   showLibraryInFolder?: (filePath: string) => Promise<{ ok: boolean }>;
+  getSettings?: () => Promise<AppSettings>;
+  updateSettings?: (settings: Partial<AppSettings>) => Promise<AppSettings>;
+  chooseDownloadDirectory?: () => Promise<AppSettings>;
+  resetDownloadDirectory?: () => Promise<AppSettings>;
+  openDownloadDirectory?: () => Promise<string>;
+  clearAllTaskRecords?: () => Promise<QueueState>;
   onDownloadProgress?: (listener: (progress: DownloadProgress) => void) => () => void;
   onDownloadQueue?: (listener: (state: QueueState) => void) => () => void;
 };
@@ -125,7 +157,7 @@ function batchPercent(tasks: QueueTask[]): number | null {
 }
 
 function App() {
-  const [view, setView] = useState<'catalog' | 'tasks' | 'library'>('catalog');
+  const [view, setView] = useState<AppView>('catalog');
   const [catalog, setCatalog] = useState(resources);
   const [catalogStatus, setCatalogStatus] = useState('正在加载官方目录');
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -142,7 +174,10 @@ function App() {
   const [libraryQuery, setLibraryQuery] = useState('');
   const [librarySubject, setLibrarySubject] = useState('');
   const [libraryMessage, setLibraryMessage] = useState('');
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [settingsMessage, setSettingsMessage] = useState('');
   const queueWasActive = useRef(false);
+  const settingsUpdateId = useRef(0);
   const lastProgressBytes = useRef<Record<string, { bytes: number; time: number }>>({});
 
   const loadCatalogData = async () => {
@@ -172,7 +207,12 @@ function App() {
     try { setLibraryItems(await desktopBridge.listLibrary()); setLibraryMessage(''); }
     catch (error) { setLibraryMessage(error instanceof Error ? error.message : String(error)); }
   };
-  useEffect(() => { void loadCatalogData(); }, []);
+  const loadSettings = async () => {
+    const desktopBridge = bridge();
+    if (!desktopBridge?.getSettings) return;
+    try { const next = await desktopBridge.getSettings(); setSettings(next); setView(next.defaultView); setSkipDownloaded(next.startupFilterMode === 'last' ? next.lastSkipDownloaded : next.defaultSkipDownloaded); setFilters(next.startupFilterMode === 'last' ? next.lastFilters : next.defaultFilters); } catch (error) { setSettingsMessage(error instanceof Error ? error.message : String(error)); }
+  };
+  useEffect(() => { void loadSettings(); void loadCatalogData(); }, []);
   useEffect(() => { void loadLibrary(); }, [view]);
   useEffect(() => {
     const desktopBridge = bridge();
@@ -199,6 +239,11 @@ function App() {
       void loadLibrary();
     }
   }, [queue.status]);
+  useEffect(() => {
+    if (!settings) return;
+    const timer = window.setTimeout(() => { void updateAppSettings({ lastFilters: filters, lastSkipDownloaded: skipDownloaded }); }, 250);
+    return () => window.clearTimeout(timer);
+  }, [filters, skipDownloaded]);
 
   const openLogin = async () => {
     const desktopBridge = bridge();
@@ -258,6 +303,18 @@ function App() {
     }
   };
   const clearHistory = async () => { const desktopBridge = bridge(); if (desktopBridge?.clearDownloadHistory) setQueue(await desktopBridge.clearDownloadHistory()); };
+  const updateAppSettings = async (patch: Partial<AppSettings>) => {
+    const desktopBridge = bridge();
+    if (!desktopBridge?.updateSettings) return;
+    const updateId = ++settingsUpdateId.current;
+    setSettings((current) => current ? { ...current, ...patch } : current);
+    try { const saved = await desktopBridge.updateSettings(patch); if (updateId === settingsUpdateId.current) { setSettings(saved); setSettingsMessage('设置已保存'); } } catch (error) { if (updateId === settingsUpdateId.current) { setSettingsMessage(error instanceof Error ? error.message : String(error)); void loadSettings(); } }
+  };
+  const chooseDirectory = async () => { const desktopBridge = bridge(); if (!desktopBridge?.chooseDownloadDirectory) return; try { setSettings(await desktopBridge.chooseDownloadDirectory()); setSettingsMessage('下载目录已更新'); } catch (error) { setSettingsMessage(error instanceof Error ? error.message : String(error)); } };
+  const resetDirectory = async () => { const desktopBridge = bridge(); if (!desktopBridge?.resetDownloadDirectory) return; try { setSettings(await desktopBridge.resetDownloadDirectory()); setSettingsMessage('已恢复默认下载目录'); } catch (error) { setSettingsMessage(error instanceof Error ? error.message : String(error)); } };
+  const openDirectory = async () => { const desktopBridge = bridge(); if (desktopBridge?.openDownloadDirectory) await desktopBridge.openDownloadDirectory(); };
+  const clearAllRecords = async () => { if (!window.confirm('确认清除全部下载任务记录和历史？不会删除已下载教材。')) return; const desktopBridge = bridge(); if (desktopBridge?.clearAllTaskRecords) { try { setQueue(await desktopBridge.clearAllTaskRecords()); setSettingsMessage('下载任务记录已清除'); } catch (error) { setSettingsMessage(error instanceof Error ? error.message : String(error)); } } };
+  const updateFilterSetting = (kind: 'defaultFilters' | 'lastFilters', field: keyof AppSettings['defaultFilters'], value: string) => { if (!settings) return; const next = { ...settings[kind], [field]: value }; setSettings({ ...settings, [kind]: next }); void updateAppSettings({ [kind]: next }); };
 
   const filterOptions = useMemo(() => computeFilterOptions(catalog, filters), [catalog, filters]);
   const matching = useMemo(() => filterResources(catalog, filters, query), [catalog, filters, query]);
@@ -309,11 +366,12 @@ function App() {
         <button className={`nav-link ${view === 'catalog' ? 'active' : ''}`} onClick={() => setView('catalog')}><Search size={18} /><span>教材目录</span></button>
         <button className={`nav-link ${view === 'library' ? 'active' : ''}`} onClick={() => setView('library')}><FolderOpen size={18} /><span>本地资料</span></button>
         <button className={`nav-link ${view === 'tasks' ? 'active' : ''}`} onClick={() => setView('tasks')}><Download size={18} /><span>下载任务</span>{activeTaskCount > 0 && <span className="count">{activeTaskCount}</span>}</button>
+        <button className={`nav-link ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}><Settings size={18} /><span>设置</span></button>
       </nav>
       <div className="sidebar-footer"><span className={`session-dot ${hasSavedSession ? '' : 'off'}`} />{hasSavedSession ? '登录档案已保存' : '未登录'}</div>
     </aside>
     <main>
-      <header className="topbar"><div><p className="eyebrow">{view === 'catalog' ? '教材目录' : view === 'tasks' ? '下载任务' : '本地资料'}</p><h1>{view === 'catalog' ? '查找并识别教材版本' : view === 'tasks' ? '队列与下载历史' : '已下载教材'}</h1></div><div className="login-area">{loginMessage && <span className="login-message">{loginMessage}</span>}{hasSavedSession && <button className="icon-button" title="退出登录" onClick={logout}><LogOut size={17} /></button>}<button className="button secondary" onClick={openLogin}><LogIn size={17} />{hasSavedSession ? '登录档案已保存' : '登录平台'}</button></div></header>
+      <header className="topbar"><div><p className="eyebrow">{view === 'catalog' ? '教材目录' : view === 'tasks' ? '下载任务' : view === 'library' ? '本地资料' : '应用设置'}</p><h1>{view === 'catalog' ? '查找并识别教材版本' : view === 'tasks' ? '队列与下载历史' : view === 'library' ? '已下载教材' : '设置'}</h1></div><div className="login-area">{loginMessage && <span className="login-message">{loginMessage}</span>}{hasSavedSession && <button className="icon-button" title="退出登录" onClick={logout}><LogOut size={17} /></button>}{view !== 'settings' && <button className="button secondary" onClick={openLogin}><LogIn size={17} />{hasSavedSession ? '登录档案已保存' : '登录平台'}</button>}</div></header>
 
       {view === 'catalog' && <>
         <section className="filter-panel" aria-label="教材筛选">
@@ -349,8 +407,31 @@ function App() {
         <p className="hint">{visibleLibraryItems.length} 个已下载文件</p>
         {visibleLibraryItems.length === 0 ? <p className="empty-hint">暂无已下载文件。请先在“教材目录”中下载资源。</p> : <div className="library-list">{visibleLibraryItems.map((item) => <LibraryRow key={item.contentId} item={item} onOpenFile={(target) => void openLibraryFile(target)} onShowFolder={(target) => void showLibraryInFolder(target)} />)}</div>}
       </section>}
+
+      {view === 'settings' && <SettingsPage settings={settings} catalog={catalog} message={settingsMessage} hasSavedSession={hasSavedSession} onUpdate={updateAppSettings} onChooseDirectory={chooseDirectory} onResetDirectory={resetDirectory} onOpenDirectory={openDirectory} onClearRecords={clearAllRecords} onClearSession={logout} onUpdateFilter={updateFilterSetting} />}
     </main>
   </div>;
+}
+
+function SettingsPage({ settings, catalog, message, hasSavedSession, onUpdate, onChooseDirectory, onResetDirectory, onOpenDirectory, onClearRecords, onClearSession, onUpdateFilter }: { settings: AppSettings | null; catalog: TextbookResource[]; message: string; hasSavedSession: boolean; onUpdate: (patch: Partial<AppSettings>) => void; onChooseDirectory: () => void; onResetDirectory: () => void; onOpenDirectory: () => void; onClearRecords: () => void; onClearSession: () => void; onUpdateFilter: (kind: 'defaultFilters' | 'lastFilters', field: keyof AppSettings['defaultFilters'], value: string) => void }) {
+  if (!settings) return <p className="empty-hint">正在加载设置…</p>;
+  const fields: Array<[keyof AppSettings['defaultFilters'], string]> = [['stage', '学段'], ['subject', '学科'], ['grade', '年级'], ['volume', '册次'], ['edition', '版本']];
+  const options = computeFilterOptions(catalog, settings.defaultFilters);
+  return <section className="settings-page">
+    {message && <div className="batch-notice">{message}</div>}
+    <div className="settings-card"><div className="settings-card-head"><div><h2>下载设置</h2><p>新下载任务会使用这里保存的目录和文件名格式。</p></div></div>
+      <div className="settings-row"><div><strong>下载目录</strong><span className="settings-help">当前：{settings.effectiveDownloadDirectory}</span></div><div className="settings-actions"><button className="button secondary small" onClick={onChooseDirectory}>选择目录</button><button className="button secondary small" onClick={onResetDirectory}>恢复默认</button><button className="button secondary small" onClick={onOpenDirectory}>打开目录</button></div></div>
+      <div className="settings-row settings-column"><div><strong>文件名格式</strong><span className="settings-help">支持：{'{教材名称}'}、{'{学段}'}、{'{学科}'}、{'{年级}'}、{'{册次}'}、{'{版本}'}、{'{年度}'}、{'{资源ID}'}、{'{短ID}'}</span></div><input className="settings-input" value={settings.filenameTemplate} onChange={(event) => onUpdate({ filenameTemplate: event.target.value })} /><span className="settings-preview">预览：{previewFilename(settings.filenameTemplate)}.pdf（未包含资源 ID 时会自动追加短 ID）</span></div>
+      <label className="settings-check"><input type="checkbox" checked={settings.downloadNotifications} onChange={(event) => onUpdate({ downloadNotifications: event.target.checked })} />下载任务结束时发送系统通知</label>
+    </div>
+    <div className="settings-card"><div className="settings-card-head"><div><h2>启动偏好</h2><p>选择每次启动时使用固定默认值，或恢复上次使用的筛选条件。</p></div></div>
+      <div className="settings-choice"><label><input type="radio" checked={settings.startupFilterMode === 'defaults'} onChange={() => onUpdate({ startupFilterMode: 'defaults' })} />使用默认筛选</label><label><input type="radio" checked={settings.startupFilterMode === 'last'} onChange={() => onUpdate({ startupFilterMode: 'last' })} />恢复上次筛选</label></div>
+      <div className="settings-filter-grid">{fields.map(([field, label]) => <label key={field}>{label}<select className="settings-input" value={settings.defaultFilters[field]} onChange={(event) => onUpdateFilter('defaultFilters', field, event.target.value)}><option value="">不限制</option>{options[field].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>)}</div>
+      <label className="settings-check"><input type="checkbox" checked={settings.defaultSkipDownloaded} onChange={(event) => onUpdate({ defaultSkipDownloaded: event.target.checked })} />默认跳过已下载资源</label>
+      <label className="settings-select-label">默认进入页面<select className="settings-input" value={settings.defaultView} onChange={(event) => onUpdate({ defaultView: event.target.value as AppView })}><option value="catalog">教材目录</option><option value="tasks">下载任务</option><option value="library">本地资料</option><option value="settings">设置</option></select></label>
+    </div>
+    <div className="settings-card"><div className="settings-card-head"><div><h2>应用与数据</h2><p>版本 {bridge()?.appVersion || '0.1.2'} · 登录档案和任务记录保存在本机。</p></div></div><div className="settings-actions"><button className="button secondary" onClick={onClearRecords}>清除全部下载任务记录</button><button className="button secondary" disabled={!hasSavedSession} onClick={onClearSession}>清除平台登录档案</button></div><p className="settings-help">清除记录或登录档案都不会删除已下载的教材文件。</p></div>
+  </section>;
 }
 
 function TextbookGroup({ groupKey, resources: group, selected, skipDownloaded, onToggleResource, taskByContentId, batchActive, onDownload }: { groupKey: string; resources: TextbookResource[]; selected: Set<string>; skipDownloaded: boolean; onToggleResource: (id: string) => void; taskByContentId: Record<string, QueueTask>; batchActive: boolean; onDownload: (resource: TextbookResource) => void }) {

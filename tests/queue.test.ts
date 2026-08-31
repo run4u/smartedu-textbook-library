@@ -43,6 +43,10 @@ function makeQueue({ downloadsDir, dataDir, downloader }: { downloadsDir: string
   });
 }
 
+function makeConfiguredQueue({ downloadsDir, dataDir, downloader, getDownloadSettings }: { downloadsDir: string; dataDir: string; downloader: any; getDownloadSettings: () => { outputDirectory: string; filenameTemplate: string } }) {
+  return new DownloadQueue({ downloadsPath: downloadsDir, dataPath: dataDir, platformSession: null, partition: 'test-partition', send: () => {}, downloadResourceFn: downloader, getDownloadSettings });
+}
+
 function blockingDownloader(options: { failFor?: Set<string>; holdMs?: number } = {}) {
   const failFor = options.failFor ?? new Set<string>();
   const holdMs = options.holdMs ?? 0;
@@ -90,6 +94,25 @@ async function waitFor(condition: () => boolean, timeoutMs = 6000) {
 }
 
 describe('DownloadQueue', () => {
+  it('freezes output settings on tasks when a batch starts', async () => {
+    const downloadsDir = makeTempDir('queue-dl-');
+    const dataDir = makeTempDir('queue-data-');
+    const firstDirectory = join(downloadsDir, 'first');
+    let current = { outputDirectory: firstDirectory, filenameTemplate: '{学科}_{短ID}' };
+    const seen: any[] = [];
+    const downloader = async (_resource: any, _session: any, _downloadsPath: string, _partition: string, _report: any, options: any) => {
+      seen.push(options);
+      return { path: join(firstDirectory, 'book.pdf'), size: 100 };
+    };
+    const queue = makeConfiguredQueue({ downloadsDir, dataDir, downloader, getDownloadSettings: () => current });
+    await queue.start(makeResources(1));
+    current = { outputDirectory: join(downloadsDir, 'second'), filenameTemplate: '{教材名称}' };
+    await waitFor(() => queue.snapshot().status === 'complete');
+    await queue.waitForLoopIdle();
+    expect(seen[0].outputDirectory).toBe(firstDirectory);
+    expect(seen[0].filenameTemplate).toBe('{学科}_{短ID}');
+  });
+
   it('downloads tasks sequentially, records the library, and never overlaps', async () => {
     const downloadsDir = makeTempDir('queue-dl-');
     const dataDir = makeTempDir('queue-data-');

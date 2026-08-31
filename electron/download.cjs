@@ -28,9 +28,9 @@ async function resolvePdf(resource, platformSession, partition, report, signal) 
 }
 
 async function downloadResource(resource, platformSession, downloadsPath, partition, report = () => {}, options = {}) {
-  const { signal } = options;
+  const { signal, outputDirectory, filenameTemplate } = options;
   const { pdfUrl, auth } = await resolvePdf(resource, platformSession, partition, report, signal);
-  const { directory, target, part } = outputPaths(resource, downloadsPath);
+  const { directory, target, part } = outputPaths(resource, downloadsPath, { directory: outputDirectory, filenameTemplate });
   await fs.mkdir(directory, { recursive: true });
   const partSize = await fs.stat(part).then((stats) => stats.size).catch(() => 0);
   const resume = partSize > 0;

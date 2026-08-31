@@ -20,17 +20,20 @@ function serializeTask(task) {
     updatedAt: task.updatedAt,
     startedAt: task.startedAt,
     completedAt: task.completedAt,
+    downloadOptions: task.downloadOptions,
   };
 }
 
 class DownloadQueue {
-  constructor({ downloadsPath, dataPath, platformSession, partition, send, downloadResourceFn }) {
+  constructor({ downloadsPath, dataPath, platformSession, partition, send, downloadResourceFn, getDownloadSettings, onBatchComplete }) {
     this.downloadsPath = downloadsPath;
     this.dataPath = dataPath;
     this.platformSession = platformSession;
     this.partition = partition;
     this.send = send;
     this.downloadResourceFn = downloadResourceFn || null;
+    this.getDownloadSettings = getDownloadSettings || (() => ({ outputDirectory: path.join(this.downloadsPath, DOWNLOAD_DIR_NAME), filenameTemplate: undefined }));
+    this.onBatchComplete = onBatchComplete || (() => {});
     this.batch = { id: null, status: 'idle', tasks: [] };
     this.history = [];
     this.abortController = null;
@@ -39,7 +42,7 @@ class DownloadQueue {
     this.wakeup = false;
   }
 
-  taskPartPath(resource) { return outputPaths(resource, this.downloadsPath).part; }
+  taskPartPath(resource, downloadOptions) { return outputPaths(resource, this.downloadsPath, { directory: downloadOptions?.outputDirectory, filenameTemplate: downloadOptions?.filenameTemplate }).part; }
 
   async librarySnapshot() {
     try { return JSON.parse(await fs.readFile(path.join(this.dataPath, 'library.json'), 'utf8')); }
@@ -169,7 +172,7 @@ class DownloadQueue {
   }
 
   async removePart(task) {
-    try { await fs.rm(this.taskPartPath(task.resource), { force: true }); } catch {}
+    try { await fs.rm(this.taskPartPath(task.resource, task.downloadOptions), { force: true }); } catch {}
   }
 
   async load() {
@@ -188,30 +191,36 @@ class DownloadQueue {
           if (task.status === 'running') { task.status = 'paused'; task.progress = { phase: 'paused', message: '上次运行被中断，可继续下载' }; }
         }
       }
+      for (const task of this.batch.tasks) {
+        if (!task.downloadOptions) task.downloadOptions = { outputDirectory: path.join(this.downloadsPath, DOWNLOAD_DIR_NAME), filenameTemplate: undefined };
+      }
     } catch { this.batch = { id: null, status: 'idle', tasks: [] }; this.history = []; }
     await this.cleanupStaleParts();
   }
 
   async cleanupStaleParts() {
-    const directory = path.join(this.downloadsPath, DOWNLOAD_DIR_NAME);
-    let files = [];
-    try { files = await fs.readdir(directory); } catch { return; }
-    const knownParts = new Set(this.batch.tasks.map((task) => this.taskPartPath(task.resource)));
-    for (const file of files) {
-      if (!file.endsWith('.part')) continue;
-      const full = path.join(directory, file);
-      if (!knownParts.has(full)) { try { await fs.rm(full, { force: true }); } catch {} }
+    const directories = new Set([path.join(this.downloadsPath, DOWNLOAD_DIR_NAME)]);
+    const knownParts = new Set(this.batch.tasks.map((task) => this.taskPartPath(task.resource, task.downloadOptions)));
+    for (const directory of directories) {
+      let files = [];
+      try { files = await fs.readdir(directory); } catch { continue; }
+      for (const file of files) {
+        if (!file.endsWith('.part')) continue;
+        const full = path.join(directory, file);
+        if (!knownParts.has(full)) { try { await fs.rm(full, { force: true }); } catch {} }
+      }
     }
   }
 
   async start(resources) {
     if (this.batch.status === 'running' || this.batch.status === 'paused') throw new Error('已有正在进行的下载任务，请先暂停、取消或等待其完成');
     this.archiveCurrent();
+    const downloadOptions = this.getDownloadSettings();
     this.batch = {
       id: makeId(),
       status: 'running',
       createdAt: now(),
-      tasks: resources.map((resource) => ({ id: makeId(), resource, status: 'queued', progress: { phase: 'queued', message: '等待下载' }, createdAt: now(), updatedAt: now() })),
+      tasks: resources.map((resource) => ({ id: makeId(), resource, downloadOptions, status: 'queued', progress: { phase: 'queued', message: '等待下载' }, createdAt: now(), updatedAt: now() })),
     };
     await this.saveState();
     this.emitState();
@@ -237,6 +246,7 @@ class DownloadQueue {
           this.batch.updatedAt = now();
           await this.saveState();
           this.emitState();
+          try { this.onBatchComplete(this.snapshot()); } catch {}
           break;
         }
         await this.runTask(task);
@@ -261,7 +271,7 @@ class DownloadQueue {
     task.updatedAt = now();
     this.emitState();
     try {
-      const result = await downloadResource(task.resource, this.platformSession, this.downloadsPath, this.partition, (progress) => this.reportTaskProgress(task, progress), { signal });
+      const result = await downloadResource(task.resource, this.platformSession, this.downloadsPath, this.partition, (progress) => this.reportTaskProgress(task, progress), { signal, outputDirectory: task.downloadOptions?.outputDirectory, filenameTemplate: task.downloadOptions?.filenameTemplate });
       task.status = 'complete';
       task.targetPath = result.path;
       task.progress = { phase: 'complete', message: '下载完成', receivedBytes: result.size, totalBytes: result.size };
@@ -388,6 +398,16 @@ class DownloadQueue {
     if (this.batch.status === 'running' || this.batch.status === 'paused') return this.snapshot();
     this.batch.tasks = this.batch.tasks.filter((task) => !TERMINAL_STATUSES.includes(task.status));
     if (this.batch.tasks.length === 0) this.batch = { id: null, status: 'idle', tasks: [] };
+    await this.saveState();
+    this.emitState();
+    return this.snapshot();
+  }
+
+  async clearAllRecords() {
+    if (this.batch.status === 'running' || this.batch.status === 'paused') throw new Error('下载任务进行中，无法清除任务记录');
+    await Promise.all(this.batch.tasks.map((task) => this.removePart(task)));
+    this.batch = { id: null, status: 'idle', tasks: [] };
+    this.history = [];
     await this.saveState();
     this.emitState();
     return this.snapshot();

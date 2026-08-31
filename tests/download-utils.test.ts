@@ -22,6 +22,18 @@ describe('filename', () => {
     const name = filename(tricky);
     expect(/[\\/:*?"<>|]/.test(name)).toBe(false);
   });
+
+  it('renders a custom template and appends a short id when the template omits identity', () => {
+    expect(filename({ ...resource, title: '数学/教材' }, '{教材名称}_{年度}')).toBe('数学_教材_2026年度_abcdefgh.pdf');
+  });
+
+  it('does not append another id when the template contains an identity token', () => {
+    expect(filename(resource, '{学科}_{短ID}')).toBe('数学_abcdefgh.pdf');
+  });
+
+  it('does not duplicate a pdf extension supplied by the user', () => {
+    expect(filename(resource, '{学科}_{短ID}.pdf')).toBe('数学_abcdefgh.pdf');
+  });
 });
 
 describe('outputPaths', () => {
@@ -31,6 +43,12 @@ describe('outputPaths', () => {
     expect(paths.directory).toBe(path.join(downloadsPath, 'SmartEdu Textbook Library'));
     expect(paths.target).toBe(path.join(paths.directory, '高中_数学_高中年级_必修 第一册_人教版（B版）_2026年度_abcdefgh.pdf'));
     expect(paths.part).toBe(`${paths.target}.part`);
+  });
+
+  it('supports a custom output directory and filename template', () => {
+    const directory = path.join('test-root', 'custom');
+    const paths = outputPaths(resource, path.join('ignored', 'downloads'), { directory, filenameTemplate: '{学科}_{年度}_{短ID}' });
+    expect(paths.target).toBe(path.join(directory, '数学_2026年度_abcdefgh.pdf'));
   });
 });
 

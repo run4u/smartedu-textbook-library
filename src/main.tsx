@@ -85,6 +85,7 @@ function App() {
   const [filters, setFilters] = useState({ stage: '', subject: '', grade: '', volume: '', edition: '' });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [hasSavedSession, setHasSavedSession] = useState(false);
+  const [sessionChecked, setSessionChecked] = useState(false);
   const [loginMessage, setLoginMessage] = useState('');
   const [batchNotice, setBatchNotice] = useState('');
   const [queue, setQueue] = useState<QueueState>({ batchId: null, status: 'idle', tasks: [], history: [] });
@@ -117,8 +118,14 @@ function App() {
         });
       }
       setCatalogStatus(result.source === 'cache' ? '正在使用本地缓存目录' : '官方目录已刷新');
-      if (desktopBridge?.getSessionStatus) setHasSavedSession((await desktopBridge.getSessionStatus()).hasSavedSession);
     } catch { setCatalogStatus('官方目录暂不可用，正在展示本地样例'); }
+  };
+  const loadSessionStatus = async () => {
+    const desktopBridge = bridge();
+    if (!desktopBridge?.getSessionStatus) { setSessionChecked(true); return; }
+    try { setHasSavedSession((await desktopBridge.getSessionStatus()).hasSavedSession); }
+    catch { setHasSavedSession(false); }
+    finally { setSessionChecked(true); }
   };
   const loadLibrary = async () => {
     const desktopBridge = bridge();
@@ -131,7 +138,7 @@ function App() {
     if (!desktopBridge?.getSettings) return;
     try { const next = await desktopBridge.getSettings(); setSettings(next); setView(next.defaultView); setSkipDownloaded(next.startupFilterMode === 'last' ? next.lastSkipDownloaded : next.defaultSkipDownloaded); setFilters(next.startupFilterMode === 'last' ? next.lastFilters : next.defaultFilters); } catch (error) { setSettingsMessage(error instanceof Error ? error.message : String(error)); }
   };
-  useEffect(() => { void loadSettings(); void loadCatalogData(); }, []);
+  useEffect(() => { void loadSettings(); void loadCatalogData(); void loadSessionStatus(); }, []);
   useEffect(() => { void loadLibrary(); }, [view]);
   useEffect(() => {
     const desktopBridge = bridge();
@@ -169,6 +176,7 @@ function App() {
     if (desktopBridge?.login) {
       const result = await desktopBridge.login();
       setHasSavedSession(result.hasSavedSession);
+      setSessionChecked(true);
       setLoginMessage(result.hasSavedSession ? (result.autoClosed ? '登录完成，已自动返回' : '登录窗口已关闭，登录档案已保存') : '登录窗口已关闭，未检测到登录档案');
     }
   };
@@ -178,6 +186,7 @@ function App() {
     if (desktopBridge?.clearSession) {
       await desktopBridge.clearSession();
       setHasSavedSession(false);
+      setSessionChecked(true);
       setLoginMessage('登录档案已清除');
     }
   };
@@ -287,10 +296,10 @@ function App() {
         <button className={`nav-link ${view === 'tasks' ? 'active' : ''}`} onClick={() => setView('tasks')}><Download size={18} /><span>下载任务</span>{activeTaskCount > 0 && <span className="count">{activeTaskCount}</span>}</button>
         <button className={`nav-link ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}><Settings size={18} /><span>设置</span></button>
       </nav>
-      <div className="sidebar-footer"><span className={`session-dot ${hasSavedSession ? '' : 'off'}`} />{hasSavedSession ? '登录档案已保存' : '未登录'}</div>
+      <div className="sidebar-footer"><span className={`session-dot ${hasSavedSession ? '' : 'off'}`} />{sessionChecked ? (hasSavedSession ? '登录档案已保存' : '未登录') : '正在检查登录状态'}</div>
     </aside>
     <main>
-      <header className="topbar"><div><p className="eyebrow">{view === 'catalog' ? '教材目录' : view === 'tasks' ? '下载任务' : view === 'library' ? '本地资料' : '应用设置'}</p><h1>{view === 'catalog' ? '查找并识别教材版本' : view === 'tasks' ? '队列与下载历史' : view === 'library' ? '已下载教材' : '设置'}</h1></div><div className="login-area">{loginMessage && <span className="login-message">{loginMessage}</span>}{hasSavedSession && <button className="icon-button" title="退出登录" onClick={logout}><LogOut size={17} /></button>}{view !== 'settings' && <button className="button secondary" onClick={openLogin}><LogIn size={17} />{hasSavedSession ? '登录档案已保存' : '登录平台'}</button>}</div></header>
+      <header className="topbar"><div><p className="eyebrow">{view === 'catalog' ? '教材目录' : view === 'tasks' ? '下载任务' : view === 'library' ? '本地资料' : '应用设置'}</p><h1>{view === 'catalog' ? '查找并识别教材版本' : view === 'tasks' ? '队列与下载历史' : view === 'library' ? '已下载教材' : '设置'}</h1></div><div className="login-area">{loginMessage && <span className="login-message">{loginMessage}</span>}{hasSavedSession && <button className="icon-button" title="退出登录" onClick={logout}><LogOut size={17} /></button>}{view !== 'settings' && <button className="button secondary" disabled={!sessionChecked} onClick={openLogin}><LogIn size={17} />{sessionChecked ? (hasSavedSession ? '登录档案已保存' : '登录平台') : '检查登录状态'}</button>}</div></header>
 
       {view === 'catalog' && <>
         <section className="filter-panel" aria-label="教材筛选">

@@ -36,11 +36,11 @@ Downloads are first written to `.part` files. Before completion, the application
 
 The development build supports the complete catalog, sign-in, download queue, and local-library workflow described above. Windows NSIS installer and portable builds can be produced locally, but they are unsigned and still need the remaining manual acceptance checks documented in [Testing Guide](docs/TESTING.md).
 
-Windows x64 installer and portable packages are available from [GitHub Releases](https://github.com/run4u/smartedu-textbook-library/releases/tag/v0.1.2). Version `0.1.2` is published as a pre-release because the packages are not code-signed and some display and extended acceptance scenarios remain to be refined.
+Windows x64 installer and portable packages for `0.1.3-alpha.1` are available from [GitHub Releases](https://github.com/run4u/smartedu-textbook-library/releases/tag/v0.1.3-alpha.1). This test release includes the latest settings and display improvements. The packages are not code-signed and may still require extended acceptance testing.
 
 Windows SmartScreen may show an “Unknown publisher” warning. Verify the SHA-256 checksums attached to the release before running a downloaded package.
 
-An unsigned and unnotarized macOS `0.1.3-alpha.1` experimental build is available for invited Apple Silicon (arm64) testing only. Intel Macs are not supported, and this artifact is not a formal release. See [macOS Apple Silicon Testing](docs/MACOS-ARM64-TESTING.md).
+The macOS experimental package is not included in this GitHub Release. Apple Silicon (arm64) testing is handled separately; Intel Macs are not supported. See [macOS Apple Silicon Testing](docs/MACOS-ARM64-TESTING.md).
 
 ## Development
 

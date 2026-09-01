@@ -36,11 +36,11 @@ SmartEdu Textbook Library 是一个本地优先的桌面应用，用于查找、
 
 开发版已支持上述完整的目录、登录、下载队列和本地资料流程。项目可以在本地生成 Windows NSIS 安装版和便携版，但产物尚未签名，仍需完成 [测试指南](docs/TESTING.md) 中列出的剩余人工验收。
 
-Windows x64 安装版和便携版可从 [GitHub Releases](https://github.com/run4u/smartedu-textbook-library/releases/tag/v0.1.2) 下载。`0.1.2` 以预发布版提供，因为安装包尚未进行代码签名，少量展示问题和扩展验收场景仍待后续完善。
+Windows x64 `0.1.3-alpha.1` 安装版和便携版可从 [GitHub Releases](https://github.com/run4u/smartedu-textbook-library/releases/tag/v0.1.3-alpha.1) 下载。该测试版包含最新的设置和显示改进，安装包尚未进行代码签名，仍需补充扩展验收测试。
 
 Windows SmartScreen 可能显示“未知发布者”提示，运行前请核对 Release 附件中的 SHA-256 校验值。
 
-项目提供仅面向 Apple Silicon（arm64）的 macOS `0.1.3-alpha.1` 实验包构建，不支持 Intel Mac。该包未进行 Apple 代码签名和公证，不属于正式发行版，只用于邀请测试；获取和测试方法见 [macOS Apple Silicon 实验包测试](docs/MACOS-ARM64-TESTING.md)。
+本次 GitHub Release 不包含 macOS 实验包。Apple Silicon（arm64）测试单独进行，不支持 Intel Mac；测试方法见 [macOS Apple Silicon 实验包测试](docs/MACOS-ARM64-TESTING.md)。
 
 ## 开发运行
 

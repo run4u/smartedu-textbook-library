@@ -9,7 +9,7 @@
 - `npm test`：34 项自动化测试通过。
 - `npm run check` 与 `npm run build`：通过。
 - `npm run dist`：可生成 NSIS 安装版与便携版（当前未签名、默认图标）。
-- GitHub Release：`v0.1.2` 以 Windows x64 Pre-release 发布，包含安装版、便携版和 SHA-256 校验文件。
+- GitHub Release：`v0.1.3-alpha.1` 以 Windows x64 Pre-release 发布，包含安装版、便携版和 SHA-256 校验文件；macOS 实验包不包含在该 Release 中。
 - 开发版启动入口：仓库根目录 `启动桌面端.cmd`。
 
 ## 一、待验证（需要你实际操作）

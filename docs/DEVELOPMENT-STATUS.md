@@ -17,7 +17,7 @@
 - 孤立文件清理：启动时删除不属于任何已知任务的 `.part` 文件，避免临时文件无提示累积。
 - 本地资料页：展示已下载文件索引，支持关键词搜索、学科筛选、打开文件、打开所在文件夹；文件被移动或删除时给出“文件已不在原位置”提示。
 - 下载任务页增强：保留最近 5 个已完成/已取消批次的历史；支持“重试全部失败项”；运行项展示速度、已用时间和剩余时间，暂停项展示断点进度。
-- Windows 分发：`npm run dist` 可生成 NSIS 安装版与便携版 exe；产物在 `release/`。`0.1.2` 已作为 GitHub Pre-release 发布，安装包内附项目许可证与 NOTICE；当前仍使用默认 Electron 图标且未做代码签名。
+- Windows 分发：`npm run dist` 可生成 NSIS 安装版与便携版 exe；产物在 `release/`。`0.1.3-alpha.1` 已作为仅包含 Windows x64 包的 GitHub Pre-release 发布，安装包内附项目许可证与 NOTICE；当前仍使用默认 Electron 图标且未做代码签名。
 - macOS 分发：`npm run dist:mac:arm64` 和手动 GitHub Actions 工作流可生成仅 Apple Silicon 的 DMG/ZIP；`0.1.3-alpha.1` 测试包未签名、未公证，不支持 Intel Mac，也不作为正式 Release 发布。
 - 设置：主进程持久化 `settings.json`，支持下载目录、文件名模板、默认/上次筛选、默认页面、跳过已下载和下载完成通知；设置页同时提供任务记录与登录档案清理入口。
 - 自动化测试：Vitest 覆盖目录字段标准化、多关键词匹配/分类聚合/选择逻辑、文件命名与 PDF 校验、设置归一化、下载目录/模板冻结和下载队列状态机；运行 `npm test`，当前 34 项通过。

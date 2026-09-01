@@ -6,6 +6,7 @@ import { DownloadQueue } from '../electron/queue.cjs';
 import { outputPaths } from '../electron/download-utils.cjs';
 
 const tempDirs: string[] = [];
+const queues: DownloadQueue[] = [];
 
 function makeTempDir(prefix: string) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -13,7 +14,8 @@ function makeTempDir(prefix: string) {
   return dir;
 }
 
-afterEach(() => {
+afterEach(async () => {
+  await Promise.all(queues.splice(0).map((queue) => queue.waitForLoopIdle()));
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -33,7 +35,7 @@ function makeResources(count: number) {
 }
 
 function makeQueue({ downloadsDir, dataDir, downloader }: { downloadsDir: string; dataDir: string; downloader: (resource: any, session: any, downloadsPath: string, partition: string, report: (progress: any) => void, options: { signal: AbortSignal }) => Promise<{ path: string; size: number }> }) {
-  return new DownloadQueue({
+  const queue = new DownloadQueue({
     downloadsPath: downloadsDir,
     dataPath: dataDir,
     platformSession: null,
@@ -41,10 +43,14 @@ function makeQueue({ downloadsDir, dataDir, downloader }: { downloadsDir: string
     send: () => {},
     downloadResourceFn: downloader,
   });
+  queues.push(queue);
+  return queue;
 }
 
 function makeConfiguredQueue({ downloadsDir, dataDir, downloader, getDownloadSettings }: { downloadsDir: string; dataDir: string; downloader: any; getDownloadSettings: () => { outputDirectory: string; filenameTemplate: string } }) {
-  return new DownloadQueue({ downloadsPath: downloadsDir, dataPath: dataDir, platformSession: null, partition: 'test-partition', send: () => {}, downloadResourceFn: downloader, getDownloadSettings });
+  const queue = new DownloadQueue({ downloadsPath: downloadsDir, dataPath: dataDir, platformSession: null, partition: 'test-partition', send: () => {}, downloadResourceFn: downloader, getDownloadSettings });
+  queues.push(queue);
+  return queue;
 }
 
 function blockingDownloader(options: { failFor?: Set<string>; holdMs?: number } = {}) {

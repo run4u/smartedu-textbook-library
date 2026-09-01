@@ -27,7 +27,23 @@ jobs:
       - run: npm test
       - run: npm run check
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-      - run: npm run lite:check
+      - name: Check Rust backend
+        shell: pwsh
+        run: |
+          npm run lite:check -- --locked --quiet 2>&1 | Tee-Object -FilePath cargo-check.log
+          if ($LASTEXITCODE -ne 0) {
+            $details = ((Get-Content cargo-check.log | Select-Object -Last 160) -join "`n") -replace '%', '%25' -replace "`r?`n", '%0A'
+            Write-Output "::error title=Rust compiler output::$details"
+            exit $LASTEXITCODE
+          }
+      - name: Upload Rust check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-lite-cargo-check-log
+          path: cargo-check.log
+          if-no-files-found: ignore
+          retention-days: 14
       - run: npm run lite:build
       - name: Upload Windows lite prototype
         uses: actions/upload-artifact@v4

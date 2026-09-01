@@ -1,10 +1,67 @@
+use futures_util::StreamExt;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex, time::Duration};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const VERSION_URL: &str =
     "https://s-file-2.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json";
+const DETAIL_PROBE_SCRIPT: &str = r#"
+(() => {
+  const state = window.__smarteduLiteProbe = window.__smarteduLiteProbe || { auth: '', urls: [] };
+  const rememberUrl = (value) => {
+    try {
+      const url = typeof value === 'string' ? value : value && value.url;
+      if (url && !state.urls.includes(url)) state.urls.push(url);
+    } catch (_) {}
+  };
+  const rememberHeaders = (headers) => {
+    try {
+      new Headers(headers || {}).forEach((value, name) => {
+        if (name.toLowerCase() === 'x-nd-auth' && value) state.auth = value;
+      });
+    } catch (_) {}
+  };
+  const originalFetch = window.fetch;
+  if (originalFetch && !originalFetch.__smarteduLiteWrapped) {
+    const wrappedFetch = function(input, init) {
+      rememberUrl(input);
+      rememberHeaders(input && input.headers);
+      rememberHeaders(init && init.headers);
+      return originalFetch.apply(this, arguments).then((response) => {
+        rememberUrl(response && response.url);
+        return response;
+      });
+    };
+    wrappedFetch.__smarteduLiteWrapped = true;
+    window.fetch = wrappedFetch;
+  }
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    rememberUrl(url);
+    return originalOpen.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    if (String(name).toLowerCase() === 'x-nd-auth' && value) state.auth = String(value);
+    return originalSetHeader.apply(this, arguments);
+  };
+})();
+"#;
+
+const READ_DETAIL_PROBE_SCRIPT: &str = r#"
+(() => {
+  const state = window.__smarteduLiteProbe || { auth: '', urls: [] };
+  const performanceUrls = performance.getEntriesByType('resource').map((entry) => entry.name);
+  return {
+    html: document.documentElement ? document.documentElement.outerHTML : '',
+    auth: state.auth || '',
+    urls: Array.from(new Set([...(state.urls || []), ...performanceUrls]))
+  };
+})()
+"#;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,19 +136,67 @@ struct SessionStatus {
     auto_closed: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueTask {
+    id: String,
+    content_id: String,
+    title: String,
+    resource_year: String,
+    size_bytes: u64,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    received_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueState {
     batch_id: Option<String>,
     status: String,
-    tasks: Vec<Value>,
+    tasks: Vec<QueueTask>,
     history: Vec<Value>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryItem {
+    content_id: String,
+    title: String,
+    stage: String,
+    subject: String,
+    grade: String,
+    volume: String,
+    edition: String,
+    resource_year: String,
+    file_name: String,
+    path: String,
+    size: u64,
+    completed_at: String,
+    exists: bool,
+}
+
+#[derive(Deserialize)]
+struct DetailProbe {
+    html: String,
+    auth: String,
+    urls: Vec<String>,
 }
 
 struct AppState {
     settings: Mutex<AppSettings>,
+    queue: Mutex<QueueState>,
     settings_path: PathBuf,
     catalog_cache_path: PathBuf,
+    library_path: PathBuf,
 }
 
 fn now_string() -> String {
@@ -100,6 +205,12 @@ fn now_string() -> String {
         .unwrap_or_default()
         .as_secs()
         .to_string()
+}
+
+fn iso_now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now_string())
 }
 
 fn default_settings(default_download_directory: String) -> AppSettings {
@@ -273,6 +384,22 @@ fn idle_queue() -> QueueState {
     }
 }
 
+fn mark_downloaded(resources: &mut [TextbookResource], library_path: &PathBuf) {
+    let downloaded: std::collections::HashSet<String> = fs::read_to_string(library_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<Vec<LibraryItem>>(&json).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| PathBuf::from(&item.path).is_file())
+        .map(|item| item.content_id)
+        .collect();
+    for resource in resources {
+        if downloaded.contains(&resource.content_id) {
+            resource.local_state = "downloaded".into();
+        }
+    }
+}
+
 fn is_credential_cookie_name(name: &str) -> bool {
     name == "UC_TOKEN"
         || name.starts_with("UC_TOKEN-")
@@ -329,6 +456,417 @@ fn cookie_window(app: &tauri::AppHandle) -> Result<WebviewWindow, String> {
         .ok_or_else(|| "未找到可用的应用窗口".to_string())
 }
 
+fn detail_url(resource: &TextbookResource) -> Result<tauri::Url, String> {
+    let mut url = tauri::Url::parse("https://basic.smartedu.cn/tchMaterial/detail")
+        .map_err(|error| error.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("contentId", &resource.content_id)
+        .append_pair("contentType", "assets_document")
+        .append_pair("catalogType", "tchMaterial")
+        .append_pair("subCatalog", "tchMaterial");
+    Ok(url)
+}
+
+fn find_pdf_url(text: &str, content_id: &str) -> Option<String> {
+    let normalized = text
+        .replace("&amp;", "&")
+        .replace("\\/", "/")
+        .replace("\\u002F", "/")
+        .replace("\\u002f", "/");
+    let pattern = Regex::new(r#"https?://[^\s\"'<>\\]+"#).ok()?;
+    let urls: Vec<&str> = pattern
+        .find_iter(&normalized)
+        .map(|item| item.as_str())
+        .collect();
+    let scoped: Vec<&str> = urls
+        .iter()
+        .copied()
+        .filter(|url| url.contains(content_id))
+        .collect();
+    let candidates = if scoped.is_empty() { &urls } else { &scoped };
+    for raw in candidates {
+        let Ok(url) = reqwest::Url::parse(raw) else {
+            continue;
+        };
+        if url.path().to_ascii_lowercase().ends_with("viewer.html") {
+            if let Some((_, value)) = url.query_pairs().find(|(name, _)| name == "file") {
+                return Some(value.into_owned());
+            }
+        }
+        if url.path().to_ascii_lowercase().ends_with(".pdf") {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+async fn read_detail_probe(window: &WebviewWindow) -> Result<DetailProbe, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let sender = Mutex::new(Some(sender));
+    window
+        .eval_with_callback(READ_DETAIL_PROBE_SCRIPT, move |result| {
+            if let Ok(mut sender) = sender.lock() {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(result);
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    let result = tokio::time::timeout(Duration::from_secs(5), receiver)
+        .await
+        .map_err(|_| "读取教材详情超时".to_string())?
+        .map_err(|_| "教材详情窗口提前关闭".to_string())?;
+    serde_json::from_str(&result).map_err(|error| format!("教材详情返回格式异常：{error}"))
+}
+
+async fn resolve_pdf(
+    app: &tauri::AppHandle,
+    resource: &TextbookResource,
+) -> Result<(String, String, WebviewWindow), String> {
+    let label = format!("smartedu-detail-{}", now_string());
+    let detail = detail_url(resource)?;
+    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(detail))
+        .title("正在解析教材详情")
+        .visible(false)
+        .initialization_script(DETAIL_PROBE_SCRIPT)
+        .on_navigation(is_platform_url)
+        .build()
+        .map_err(|error| format!("创建教材详情窗口失败：{error}"))?;
+    let result = async {
+        for _ in 0..24 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let probe = match read_detail_probe(&window).await {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let mut searchable = probe.html;
+            searchable.push('\n');
+            searchable.push_str(&probe.urls.join("\n"));
+            if let Some(pdf_url) = find_pdf_url(&searchable, &resource.content_id) {
+                return Ok((pdf_url, probe.auth));
+            }
+        }
+        Err("未能从教材详情解析到 PDF 地址，请确认登录状态和资源权限".to_string())
+    }
+    .await;
+    match result {
+        Ok((pdf_url, auth)) => Ok((pdf_url, auth, window)),
+        Err(error) => {
+            let _ = window.close();
+            Err(error)
+        }
+    }
+}
+
+fn cookie_header_for_url(window: &WebviewWindow, url: &str) -> Result<String, String> {
+    let url = tauri::Url::parse(url).map_err(|error| error.to_string())?;
+    window
+        .cookies_for_url(url)
+        .map_err(|error| error.to_string())
+        .map(|cookies| {
+            cookies
+                .iter()
+                .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let invalid = Regex::new(r#"[\\/:*?\"<>|\x00-\x1f]"#).expect("valid filename regex");
+    let repeated = Regex::new(r"_+").expect("valid underscore regex");
+    repeated
+        .replace_all(&invalid.replace_all(value, "_"), "_")
+        .trim()
+        .trim_end_matches(&['.', ' '][..])
+        .to_string()
+}
+
+fn output_filename(resource: &TextbookResource, template: &str) -> String {
+    let source = if template.trim().is_empty() {
+        "{学段}_{学科}_{年级}_{册次}_{版本}_{年度}_{短ID}"
+    } else {
+        template
+    };
+    let short_id = resource.content_id.chars().take(8).collect::<String>();
+    let replacements = [
+        ("{教材名称}", resource.title.as_str()),
+        ("{学段}", resource.stage.as_str()),
+        ("{学科}", resource.subject.as_str()),
+        ("{年级}", resource.grade.as_str()),
+        ("{册次}", resource.volume.as_str()),
+        ("{版本}", resource.edition.as_str()),
+        ("{年度}", resource.resource_year.as_str()),
+        ("{资源ID}", resource.content_id.as_str()),
+        ("{短ID}", short_id.as_str()),
+    ];
+    let mut rendered = source.to_string();
+    for (token, value) in replacements {
+        rendered = rendered.replace(token, value);
+    }
+    rendered = Regex::new(r"\{[^{}]+\}")
+        .expect("valid template regex")
+        .replace_all(&rendered, "")
+        .to_string();
+    rendered = sanitize_filename(&rendered);
+    if rendered.is_empty() {
+        rendered = format!("教材_{short_id}");
+    }
+    rendered = Regex::new(r"(?i)\.pdf$")
+        .expect("valid extension regex")
+        .replace(&rendered, "")
+        .to_string();
+    if !source.contains("{短ID}") && !source.contains("{资源ID}") {
+        rendered.push('_');
+        rendered.push_str(&short_id);
+    }
+    format!("{rendered}.pdf")
+}
+
+fn update_task<F>(app: &tauri::AppHandle, task_id: &str, update: F)
+where
+    F: FnOnce(&mut QueueTask, &mut QueueState),
+{
+    let state = app.state::<AppState>();
+    let snapshot = {
+        let mut queue = match state.queue.lock() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let Some(index) = queue.tasks.iter().position(|task| task.id == task_id) else {
+            return;
+        };
+        let mut task = queue.tasks.remove(index);
+        update(&mut task, &mut queue);
+        queue.tasks.insert(index, task);
+        queue.clone()
+    };
+    let _ = app.emit("download:queue", snapshot);
+}
+
+fn report_progress(
+    app: &tauri::AppHandle,
+    task_id: &str,
+    phase: &str,
+    message: &str,
+    received_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+) {
+    update_task(app, task_id, |task, _queue| {
+        task.phase = Some(phase.into());
+        task.message = Some(message.into());
+        task.received_bytes = received_bytes;
+        task.total_bytes = total_bytes;
+    });
+    let state = app.state::<AppState>();
+    if let Ok(queue) = state.queue.lock() {
+        if let Some(task) = queue.tasks.iter().find(|task| task.id == task_id) {
+            let _ = app.emit(
+                "download:progress",
+                serde_json::json!({
+                    "taskId": task.id,
+                    "contentId": task.content_id,
+                    "phase": phase,
+                    "message": message,
+                    "receivedBytes": received_bytes,
+                    "totalBytes": total_bytes,
+                }),
+            );
+        }
+    };
+}
+
+async fn save_library_item(app: &tauri::AppHandle, item: LibraryItem) -> Result<(), String> {
+    let path = app.state::<AppState>().library_path.clone();
+    let mut items: Vec<LibraryItem> = tokio::fs::read_to_string(&path)
+        .await
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    items.retain(|current| current.content_id != item.content_id);
+    items.insert(0, item);
+    tokio::fs::write(
+        path,
+        serde_json::to_vec_pretty(&items).map_err(|error| error.to_string())?,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn download_single(
+    app: tauri::AppHandle,
+    resource: TextbookResource,
+    task_id: String,
+) -> Result<(PathBuf, u64), String> {
+    report_progress(
+        &app,
+        &task_id,
+        "resolving",
+        "正在验证登录并解析教材详情",
+        None,
+        None,
+    );
+    let (pdf_url, auth, detail_window) = resolve_pdf(&app, &resource).await?;
+    let cookie = cookie_header_for_url(&detail_window, &pdf_url).unwrap_or_default();
+    let _ = detail_window.close();
+    let settings = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let directory = PathBuf::from(&settings.effective_download_directory);
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| error.to_string())?;
+    let target = directory.join(output_filename(&resource, &settings.filename_template));
+    let part = PathBuf::from(format!("{}.part", target.to_string_lossy()));
+    let part_size = tokio::fs::metadata(&part)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut request = client
+        .get(&pdf_url)
+        .header(reqwest::header::REFERER, detail_url(&resource)?.to_string());
+    if !auth.is_empty() {
+        request = request.header("X-Nd-Auth", auth);
+    }
+    if !cookie.is_empty() {
+        request = request.header(reqwest::header::COOKIE, cookie);
+    }
+    if part_size > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={part_size}-"));
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("下载请求失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载请求失败：HTTP {}", response.status()));
+    }
+    let resumed = part_size > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if part_size > 0 && !resumed {
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    let remaining = response.content_length().unwrap_or_default();
+    let base = if resumed { part_size } else { 0 };
+    let total = if remaining > 0 {
+        base + remaining
+    } else {
+        resource.size_bytes
+    };
+    report_progress(
+        &app,
+        &task_id,
+        "downloading",
+        if resumed {
+            "继续下载"
+        } else {
+            "正在下载"
+        },
+        Some(base),
+        Some(total),
+    );
+    let mut output = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resumed)
+        .truncate(!resumed)
+        .open(&part)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut stream = response.bytes_stream();
+    let mut received = base;
+    let mut last_reported = base;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("下载中断：{error}"))?;
+        output
+            .write_all(&chunk)
+            .await
+            .map_err(|error| error.to_string())?;
+        received += chunk.len() as u64;
+        if received.saturating_sub(last_reported) >= 256 * 1024 {
+            last_reported = received;
+            report_progress(
+                &app,
+                &task_id,
+                "downloading",
+                if resumed {
+                    "继续下载"
+                } else {
+                    "正在下载"
+                },
+                Some(received),
+                Some(total),
+            );
+        }
+    }
+    output.flush().await.map_err(|error| error.to_string())?;
+    drop(output);
+    report_progress(
+        &app,
+        &task_id,
+        "verifying",
+        "正在校验文件",
+        Some(received),
+        Some(total),
+    );
+    let mut file = tokio::fs::File::open(&part)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut header = [0_u8; 5];
+    file.read_exact(&mut header)
+        .await
+        .map_err(|error| error.to_string())?;
+    let size = file
+        .metadata()
+        .await
+        .map_err(|error| error.to_string())?
+        .len();
+    if &header != b"%PDF-" {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err("下载内容不是 PDF 文件".into());
+    }
+    if resource.size_bytes > 0 && size != resource.size_bytes {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(format!(
+            "文件大小校验失败：期望 {}，实际 {}",
+            resource.size_bytes, size
+        ));
+    }
+    let _ = tokio::fs::remove_file(&target).await;
+    tokio::fs::rename(&part, &target)
+        .await
+        .map_err(|error| error.to_string())?;
+    save_library_item(
+        &app,
+        LibraryItem {
+            content_id: resource.content_id.clone(),
+            title: resource.title.clone(),
+            stage: resource.stage.clone(),
+            subject: resource.subject.clone(),
+            grade: resource.grade.clone(),
+            volume: resource.volume.clone(),
+            edition: resource.edition.clone(),
+            resource_year: resource.resource_year.clone(),
+            file_name: target
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "教材.pdf".into()),
+            path: target.to_string_lossy().into_owned(),
+            size,
+            completed_at: iso_now(),
+            exists: true,
+        },
+    )
+    .await?;
+    Ok((target, size))
+}
+
 #[tauri::command]
 async fn load_catalog(
     app: tauri::AppHandle,
@@ -341,9 +879,12 @@ async fn load_catalog(
     if let Some(mut response) = cached {
         response.source = "cache".into();
         response.warning = None;
+        mark_downloaded(&mut response.resources, &state.library_path);
         let cache_path = state.catalog_cache_path.clone();
+        let library_path = state.library_path.clone();
         tauri::async_runtime::spawn(async move {
-            if let Ok(resources) = fetch_catalog().await {
+            if let Ok(mut resources) = fetch_catalog().await {
+                mark_downloaded(&mut resources, &library_path);
                 let refreshed = CatalogResponse {
                     resources,
                     source: "official".into(),
@@ -359,7 +900,8 @@ async fn load_catalog(
         return Ok(response);
     }
 
-    let resources = fetch_catalog().await?;
+    let mut resources = fetch_catalog().await?;
+    mark_downloaded(&mut resources, &state.library_path);
     let response = CatalogResponse {
         resources,
         source: "official".into(),
@@ -483,48 +1025,122 @@ async fn clear_session(app: tauri::AppHandle) -> Result<SessionStatus, String> {
     })
 }
 #[tauri::command]
-fn download_state() -> QueueState {
-    idle_queue()
+fn download_state(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+    state
+        .queue
+        .lock()
+        .map(|queue| queue.clone())
+        .map_err(|error| error.to_string())
 }
 #[tauri::command]
-fn start_download(_resources: Vec<TextbookResource>) -> Result<QueueState, String> {
-    Err("轻量版原型尚未完成登录 Cookie 接管和带凭据下载".into())
+async fn start_download(
+    resources: Vec<TextbookResource>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<QueueState, String> {
+    if resources.len() != 1 {
+        return Err("轻量版当前测试阶段每次仅支持下载一本教材".into());
+    }
+    if !session_status(app.clone()).await?.has_saved_session {
+        return Err("尚未检测到平台登录档案，请先登录".into());
+    }
+    let resource = resources.into_iter().next().expect("one resource");
+    let id = format!("lite-task-{}", now_string());
+    let queue = QueueState {
+        batch_id: Some(format!("lite-batch-{}", now_string())),
+        status: "running".into(),
+        tasks: vec![QueueTask {
+            id: id.clone(),
+            content_id: resource.content_id.clone(),
+            title: resource.title.clone(),
+            resource_year: resource.resource_year.clone(),
+            size_bytes: resource.size_bytes,
+            status: "running".into(),
+            error: None,
+            phase: Some("resolving".into()),
+            message: Some("正在准备教材详情".into()),
+            received_bytes: None,
+            total_bytes: None,
+        }],
+        history: vec![],
+    };
+    *state.queue.lock().map_err(|error| error.to_string())? = queue.clone();
+    let _ = app.emit("download:queue", queue.clone());
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match download_single(worker_app.clone(), resource, id.clone()).await {
+            Ok((_path, size)) => update_task(&worker_app, &id, |task, queue| {
+                task.status = "complete".into();
+                task.phase = Some("complete".into());
+                task.message = Some("下载完成".into());
+                task.received_bytes = Some(size);
+                task.total_bytes = Some(size);
+                task.error = None;
+                queue.status = "complete".into();
+            }),
+            Err(error) => update_task(&worker_app, &id, |task, queue| {
+                task.status = "error".into();
+                task.phase = Some("error".into());
+                task.message = Some(error.clone());
+                task.error = Some(error);
+                queue.status = "complete".into();
+            }),
+        }
+    });
+    Ok(queue)
 }
 #[tauri::command]
-fn pause_download() -> QueueState {
-    idle_queue()
+fn pause_download(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+    state
+        .queue
+        .lock()
+        .map(|queue| queue.clone())
+        .map_err(|error| error.to_string())
 }
 #[tauri::command]
-fn resume_download() -> QueueState {
-    idle_queue()
+fn resume_download(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+    pause_download(state)
 }
 #[tauri::command]
-fn cancel_download() -> QueueState {
-    idle_queue()
+fn cancel_download(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+    pause_download(state)
 }
 #[tauri::command]
-fn retry_task(_task_id: String) -> QueueState {
-    idle_queue()
+fn retry_task(_task_id: String, state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+    pause_download(state)
 }
 #[tauri::command]
-fn retry_all_tasks() -> QueueState {
-    idle_queue()
+fn retry_all_tasks(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+    pause_download(state)
 }
 #[tauri::command]
-fn clear_finished_tasks() -> QueueState {
-    idle_queue()
+fn clear_finished_tasks(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+    let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+    if queue.status == "complete" || queue.status == "canceled" {
+        *queue = idle_queue();
+    }
+    Ok(queue.clone())
 }
 #[tauri::command]
-fn clear_download_history() -> QueueState {
-    idle_queue()
+fn clear_download_history(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+    pause_download(state)
 }
 #[tauri::command]
-fn clear_all_task_records() -> QueueState {
-    idle_queue()
+fn clear_all_task_records(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+    let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+    *queue = idle_queue();
+    Ok(queue.clone())
 }
 #[tauri::command]
-fn list_library() -> Vec<Value> {
-    vec![]
+fn list_library(state: tauri::State<'_, AppState>) -> Vec<LibraryItem> {
+    let mut items: Vec<LibraryItem> = fs::read_to_string(&state.library_path)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    for item in &mut items {
+        item.exists = PathBuf::from(&item.path).is_file();
+    }
+    items
 }
 #[tauri::command]
 fn choose_download_directory(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
@@ -573,8 +1189,10 @@ pub fn run() {
                 });
             app.manage(AppState {
                 settings: Mutex::new(settings),
+                queue: Mutex::new(idle_queue()),
                 settings_path,
                 catalog_cache_path: data_dir.join("catalog-cache.json"),
+                library_path: data_dir.join("library.json"),
             });
             Ok(())
         })
@@ -608,7 +1226,27 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_credential_cookie_name, is_platform_domain};
+    use super::{
+        find_pdf_url, is_credential_cookie_name, is_platform_domain, output_filename,
+        TextbookResource,
+    };
+
+    fn resource() -> TextbookResource {
+        TextbookResource {
+            content_id: "abcdefgh-1234-5678-90ab-cdef01234567".into(),
+            title: "数学/教材".into(),
+            stage: "高中".into(),
+            subject: "数学".into(),
+            grade: "高中年级".into(),
+            volume: "必修 第一册".into(),
+            edition: "人教版（B版）".into(),
+            resource_year: "2026年度".into(),
+            online_time: String::new(),
+            update_time: String::new(),
+            size_bytes: 100,
+            local_state: "not-downloaded".into(),
+        }
+    }
 
     #[test]
     fn recognizes_only_platform_credential_cookie_names() {
@@ -627,5 +1265,33 @@ mod tests {
         assert!(is_platform_domain(Some("s-file-2.ykt.cbern.com.cn")));
         assert!(!is_platform_domain(Some("smartedu.cn.example.com")));
         assert!(!is_platform_domain(None));
+    }
+
+    #[test]
+    fn finds_pdf_in_viewer_and_direct_urls() {
+        let id = "abcdefgh-1234-5678-90ab-cdef01234567";
+        let viewer = format!(
+            "https://example.com/viewer.html?file=https%3A%2F%2Fcdn.example.com%2F{id}%2Fbook.pdf"
+        );
+        assert_eq!(
+            find_pdf_url(&viewer, id).as_deref(),
+            Some("https://cdn.example.com/abcdefgh-1234-5678-90ab-cdef01234567/book.pdf")
+        );
+        assert_eq!(
+            find_pdf_url("https:\\/\\/cdn.example.com\\/book.pdf", id).as_deref(),
+            Some("https://cdn.example.com/book.pdf")
+        );
+    }
+
+    #[test]
+    fn renders_safe_unique_pdf_filename() {
+        assert_eq!(
+            output_filename(&resource(), "{教材名称}_{年度}"),
+            "数学_教材_2026年度_abcdefgh.pdf"
+        );
+        assert_eq!(
+            output_filename(&resource(), "{学科}_{短ID}.pdf"),
+            "数学_abcdefgh.pdf"
+        );
     }
 }

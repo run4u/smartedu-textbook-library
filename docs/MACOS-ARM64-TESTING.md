@@ -4,13 +4,13 @@
 
 ## 获取与校验
 
-GitHub Actions 的 `macOS arm64 experimental build` 工作流会生成：
+GitHub Actions 的 `macOS arm64 experimental build` 工作流会将以下文件分别上传为 Artifact，测试时优先下载 DMG 和 SHA-256 校验文件，ZIP 作为备用：
 
 - `SmartEdu Textbook Library-0.1.3-alpha.1-macOS-arm64.dmg`
 - `SmartEdu Textbook Library-0.1.3-alpha.1-macOS-arm64.zip`
 - `SHA256SUMS-macOS-arm64.txt`
 
-下载 Artifact 后先核对 SHA-256，再测试 DMG；ZIP 作为备用包。
+下载后先核对 SHA-256，再测试 DMG。
 
 ## 首次打开
 

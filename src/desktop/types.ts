@@ -1,0 +1,81 @@
+import type { TextbookResource } from '../data/fixtures';
+
+export type TaskStatus = 'queued' | 'running' | 'paused' | 'complete' | 'error' | 'canceled';
+export type QueueStatus = 'idle' | 'running' | 'paused' | 'complete' | 'canceled';
+export type QueueTask = {
+  id: string;
+  contentId: string;
+  title: string;
+  resourceYear: string;
+  sizeBytes: number;
+  status: TaskStatus;
+  error?: string;
+  phase?: string;
+  message?: string;
+  receivedBytes?: number;
+  totalBytes?: number;
+  updatedAt?: string;
+  startedAt?: string;
+  completedAt?: string;
+};
+export type HistoryBatch = { id: string; status: QueueStatus; createdAt?: string; updatedAt?: string; tasks: QueueTask[] };
+export type QueueState = { batchId: string | null; status: QueueStatus; createdAt?: string; tasks: QueueTask[]; history: HistoryBatch[] };
+export type DownloadProgress = { taskId: string; contentId: string; phase: string; message: string; receivedBytes?: number; totalBytes?: number };
+export type LibraryItem = {
+  contentId: string;
+  title: string;
+  stage: string;
+  subject: string;
+  grade: string;
+  volume: string;
+  edition: string;
+  resourceYear: string;
+  fileName: string;
+  path: string;
+  size: number;
+  completedAt: string;
+  exists: boolean;
+};
+export type AppView = 'catalog' | 'tasks' | 'library' | 'settings';
+export type AppSettings = {
+  downloadDirectory: string;
+  effectiveDownloadDirectory: string;
+  defaultDownloadDirectory: string;
+  filenameTemplate: string;
+  startupFilterMode: 'defaults' | 'last';
+  defaultFilters: { stage: string; subject: string; grade: string; volume: string; edition: string };
+  lastFilters: { stage: string; subject: string; grade: string; volume: string; edition: string };
+  defaultSkipDownloaded: boolean;
+  lastSkipDownloaded: boolean;
+  defaultView: AppView;
+  downloadNotifications: boolean;
+};
+
+export type TextbookBridge = {
+  appVersion?: string;
+  loadCatalog?: () => Promise<{ resources: TextbookResource[]; source: string; warning?: string }>;
+  getSessionStatus?: () => Promise<{ hasSavedSession: boolean }>;
+  login?: () => Promise<{ hasSavedSession: boolean; autoClosed?: boolean }>;
+  clearSession?: () => Promise<{ hasSavedSession: boolean }>;
+  downloadState?: () => Promise<QueueState>;
+  startDownload?: (resources: TextbookResource[]) => Promise<QueueState>;
+  pauseDownload?: () => Promise<QueueState>;
+  resumeDownload?: () => Promise<QueueState>;
+  cancelDownload?: () => Promise<QueueState>;
+  retryTask?: (taskId: string) => Promise<QueueState>;
+  retryAllTasks?: () => Promise<QueueState>;
+  clearFinishedTasks?: () => Promise<QueueState>;
+  clearDownloadHistory?: () => Promise<QueueState>;
+  listLibrary?: () => Promise<LibraryItem[]>;
+  openLibraryFile?: (filePath: string) => Promise<string>;
+  showLibraryInFolder?: (filePath: string) => Promise<{ ok: boolean }>;
+  getSettings?: () => Promise<AppSettings>;
+  updateSettings?: (settings: Partial<AppSettings>) => Promise<AppSettings>;
+  chooseDownloadDirectory?: () => Promise<AppSettings>;
+  resetDownloadDirectory?: () => Promise<AppSettings>;
+  openDownloadDirectory?: () => Promise<string>;
+  clearAllTaskRecords?: () => Promise<QueueState>;
+  onDownloadProgress?: (listener: (progress: DownloadProgress) => void) => () => void;
+  onDownloadQueue?: (listener: (state: QueueState) => void) => () => void;
+};
+

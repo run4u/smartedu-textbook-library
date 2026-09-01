@@ -1,6 +1,7 @@
 node_modules/
 dist/
 release/
+src-tauri/target/
 macos-test-artifact/
 .vite/
 *.log

@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { CheckCircle2, Download, FileText, FolderOpen, LoaderCircle, LogIn, LogOut, PanelLeftClose, PanelLeftOpen, Pause, Play, RefreshCw, Search, Settings, Trash2, X } from 'lucide-react';
 import { resources, type TextbookResource } from './data/fixtures';
+import { desktopBridge as bridge } from './desktop/bridge';
+import type { AppSettings, AppView, DownloadProgress, LibraryItem, QueueState, QueueTask, TaskStatus } from './desktop/types';
 import { computeFilterOptions, filterFields, filterResources, groupResources, getSelectableResources, toggleAllSelection, toggleSkipDownloaded } from './lib/catalog';
 import './styles.css';
 
@@ -31,89 +33,6 @@ function previewFilename(template: string): string {
   rendered = rendered.replace(/\.pdf$/i, '');
   if (!sourceTemplate.includes('{短ID}') && !sourceTemplate.includes('{资源ID}')) rendered = `${rendered}_${sample.shortId}`;
   return rendered;
-}
-
-type TaskStatus = 'queued' | 'running' | 'paused' | 'complete' | 'error' | 'canceled';
-type QueueStatus = 'idle' | 'running' | 'paused' | 'complete' | 'canceled';
-type QueueTask = {
-  id: string;
-  contentId: string;
-  title: string;
-  resourceYear: string;
-  sizeBytes: number;
-  status: TaskStatus;
-  error?: string;
-  phase?: string;
-  message?: string;
-  receivedBytes?: number;
-  totalBytes?: number;
-  updatedAt?: string;
-  startedAt?: string;
-  completedAt?: string;
-};
-type HistoryBatch = { id: string; status: QueueStatus; createdAt?: string; updatedAt?: string; tasks: QueueTask[] };
-type QueueState = { batchId: string | null; status: QueueStatus; createdAt?: string; tasks: QueueTask[]; history: HistoryBatch[] };
-type DownloadProgress = { taskId: string; contentId: string; phase: string; message: string; receivedBytes?: number; totalBytes?: number };
-type LibraryItem = {
-  contentId: string;
-  title: string;
-  stage: string;
-  subject: string;
-  grade: string;
-  volume: string;
-  edition: string;
-  resourceYear: string;
-  fileName: string;
-  path: string;
-  size: number;
-  completedAt: string;
-  exists: boolean;
-};
-type AppView = 'catalog' | 'tasks' | 'library' | 'settings';
-type AppSettings = {
-  downloadDirectory: string;
-  effectiveDownloadDirectory: string;
-  defaultDownloadDirectory: string;
-  filenameTemplate: string;
-  startupFilterMode: 'defaults' | 'last';
-  defaultFilters: { stage: string; subject: string; grade: string; volume: string; edition: string };
-  lastFilters: { stage: string; subject: string; grade: string; volume: string; edition: string };
-  defaultSkipDownloaded: boolean;
-  lastSkipDownloaded: boolean;
-  defaultView: AppView;
-  downloadNotifications: boolean;
-};
-
-type TextbookBridge = {
-  appVersion?: string;
-  loadCatalog?: () => Promise<{ resources: TextbookResource[]; source: string }>;
-  getSessionStatus?: () => Promise<{ hasSavedSession: boolean }>;
-  login?: () => Promise<{ hasSavedSession: boolean; autoClosed?: boolean }>;
-  clearSession?: () => Promise<{ hasSavedSession: boolean }>;
-  downloadState?: () => Promise<QueueState>;
-  startDownload?: (resources: TextbookResource[]) => Promise<QueueState>;
-  pauseDownload?: () => Promise<QueueState>;
-  resumeDownload?: () => Promise<QueueState>;
-  cancelDownload?: () => Promise<QueueState>;
-  retryTask?: (taskId: string) => Promise<QueueState>;
-  retryAllTasks?: () => Promise<QueueState>;
-  clearFinishedTasks?: () => Promise<QueueState>;
-  clearDownloadHistory?: () => Promise<QueueState>;
-  listLibrary?: () => Promise<LibraryItem[]>;
-  openLibraryFile?: (filePath: string) => Promise<string>;
-  showLibraryInFolder?: (filePath: string) => Promise<{ ok: boolean }>;
-  getSettings?: () => Promise<AppSettings>;
-  updateSettings?: (settings: Partial<AppSettings>) => Promise<AppSettings>;
-  chooseDownloadDirectory?: () => Promise<AppSettings>;
-  resetDownloadDirectory?: () => Promise<AppSettings>;
-  openDownloadDirectory?: () => Promise<string>;
-  clearAllTaskRecords?: () => Promise<QueueState>;
-  onDownloadProgress?: (listener: (progress: DownloadProgress) => void) => () => void;
-  onDownloadQueue?: (listener: (state: QueueState) => void) => () => void;
-};
-
-function bridge(): TextbookBridge | undefined {
-  return (window as Window & { textbookLibrary?: TextbookBridge }).textbookLibrary;
 }
 
 const statusLabels: Record<TaskStatus, string> = {

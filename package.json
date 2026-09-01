@@ -24,9 +24,13 @@
     "test": "vitest run",
     "pack": "npm run build && electron-builder --win --dir",
     "dist": "npm run build && electron-builder --win",
-    "dist:mac:arm64": "npm run build && electron-builder --mac dmg zip --arm64 --publish never"
+    "dist:mac:arm64": "npm run build && electron-builder --mac dmg zip --arm64 --publish never",
+    "lite:dev": "tauri dev",
+    "lite:check": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "lite:build": "tauri build"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
     "@types/node": "26.4.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.5",
@@ -108,5 +112,8 @@
       "createStartMenuShortcut": true,
       "license": "LICENSE"
     }
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1"
   }
 }

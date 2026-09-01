@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex, time::Duration};
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 const VERSION_URL: &str =
     "https://s-file-2.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json";
@@ -265,6 +265,62 @@ fn idle_queue() -> QueueState {
     }
 }
 
+fn is_credential_cookie_name(name: &str) -> bool {
+    name == "UC_TOKEN"
+        || name.starts_with("UC_TOKEN-")
+        || name == "UC_SSO_TGC"
+        || name.starts_with("UC_SSO_TGC-")
+}
+
+fn is_platform_domain(domain: Option<&str>) -> bool {
+    domain.is_some_and(|value| {
+        let value = value.trim_start_matches('.').to_ascii_lowercase();
+        value == "smartedu.cn"
+            || value.ends_with(".smartedu.cn")
+            || value == "ykt.cbern.com.cn"
+            || value.ends_with(".ykt.cbern.com.cn")
+    })
+}
+
+fn is_platform_url(url: &tauri::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == "smartedu.cn"
+            || host.ends_with(".smartedu.cn")
+            || host == "ykt.cbern.com.cn"
+            || host.ends_with(".ykt.cbern.com.cn")
+    })
+}
+
+fn session_cookie_values(window: &WebviewWindow) -> Result<HashMap<String, String>, String> {
+    window
+        .cookies()
+        .map_err(|error| error.to_string())
+        .map(|cookies| {
+            cookies
+                .into_iter()
+                .filter(|cookie| {
+                    is_platform_domain(cookie.domain()) && is_credential_cookie_name(cookie.name())
+                })
+                .map(|cookie| {
+                    let key = format!(
+                        "{}:{}:{}",
+                        cookie.domain().unwrap_or_default(),
+                        cookie.path().unwrap_or_default(),
+                        cookie.name()
+                    );
+                    (key, cookie.value().to_string())
+                })
+                .collect()
+        })
+}
+
+fn cookie_window(app: &tauri::AppHandle) -> Result<WebviewWindow, String> {
+    app.get_webview_window("smartedu-login")
+        .or_else(|| app.get_webview_window("main"))
+        .ok_or_else(|| "未找到可用的应用窗口".to_string())
+}
+
 #[tauri::command]
 async fn load_catalog(state: tauri::State<'_, AppState>) -> Result<CatalogResponse, String> {
     match fetch_catalog().await {
@@ -343,15 +399,17 @@ fn update_settings(
 }
 
 #[tauri::command]
-fn session_status() -> SessionStatus {
-    SessionStatus {
-        has_saved_session: false,
+async fn session_status(app: tauri::AppHandle) -> Result<SessionStatus, String> {
+    let cookies = session_cookie_values(&cookie_window(&app)?)?;
+    Ok(SessionStatus {
+        has_saved_session: !cookies.is_empty(),
         auto_closed: false,
-    }
+    })
 }
 
 #[tauri::command]
 async fn open_login(app: tauri::AppHandle) -> Result<SessionStatus, String> {
+    let baseline = session_cookie_values(&cookie_window(&app)?)?;
     if let Some(window) = app.get_webview_window("smartedu-login") {
         window.set_focus().map_err(|error| error.to_string())?;
     } else {
@@ -367,21 +425,41 @@ async fn open_login(app: tauri::AppHandle) -> Result<SessionStatus, String> {
         .title("登录国家智慧教育平台 - 轻量版原型")
         .inner_size(1080.0, 760.0)
         .min_inner_size(820.0, 600.0)
+        .on_navigation(is_platform_url)
         .build()
         .map_err(|error| error.to_string())?;
     }
+    let mut auto_closed = false;
     while app.get_webview_window("smartedu-login").is_some() {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let Some(window) = app.get_webview_window("smartedu-login") else {
+            break;
+        };
+        let Ok(current) = session_cookie_values(&window) else {
+            continue;
+        };
+        let has_new_credential = current
+            .iter()
+            .any(|(key, value)| baseline.get(key) != Some(value));
+        if has_new_credential {
+            auto_closed = true;
+            window.close().map_err(|error| error.to_string())?;
+        }
     }
+    let mut status = session_status(app).await?;
+    status.auto_closed = auto_closed;
+    Ok(status)
+}
+
+#[tauri::command]
+async fn clear_session(app: tauri::AppHandle) -> Result<SessionStatus, String> {
+    cookie_window(&app)?
+        .clear_all_browsing_data()
+        .map_err(|error| error.to_string())?;
     Ok(SessionStatus {
         has_saved_session: false,
         auto_closed: false,
     })
-}
-
-#[tauri::command]
-fn clear_session() -> SessionStatus {
-    session_status()
 }
 #[tauri::command]
 fn download_state() -> QueueState {
@@ -505,4 +583,28 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_credential_cookie_name, is_platform_domain};
+
+    #[test]
+    fn recognizes_only_platform_credential_cookie_names() {
+        assert!(is_credential_cookie_name("UC_TOKEN"));
+        assert!(is_credential_cookie_name("UC_TOKEN-abc-product"));
+        assert!(is_credential_cookie_name("UC_SSO_TGC"));
+        assert!(is_credential_cookie_name("UC_SSO_TGC-login"));
+        assert!(!is_credential_cookie_name("UC_TOKENIZED"));
+        assert!(!is_credential_cookie_name("session_id"));
+    }
+
+    #[test]
+    fn recognizes_only_smartedu_platform_domains() {
+        assert!(is_platform_domain(Some(".smartedu.cn")));
+        assert!(is_platform_domain(Some("basic.smartedu.cn")));
+        assert!(is_platform_domain(Some("s-file-2.ykt.cbern.com.cn")));
+        assert!(!is_platform_domain(Some("smartedu.cn.example.com")));
+        assert!(!is_platform_domain(None));
+    }
 }

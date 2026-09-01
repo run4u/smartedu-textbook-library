@@ -8,6 +8,7 @@
 - Electron 仍使用原有 preload/IPC，不改变标准版行为。
 - Tauri 使用 Rust command 和 event 适配器。
 - Rust 后端可加载官方教材目录，并在失败时读取本地缓存。
+- 已有目录缓存会在启动时立即显示，官方分片在后台并发刷新，完成后自动更新界面。
 - Rust 后端提供独立设置文件和平台登录 WebView 窗口。
 - 登录窗口可读取平台 HttpOnly Cookie，识别登录成功后自动返回，并复用 WebView 的持久化登录档案。
 - 可在轻量版内清除平台 Cookie、缓存及其他 WebView 浏览数据。

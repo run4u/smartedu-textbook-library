@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex, time::Duration};
-use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 const VERSION_URL: &str =
     "https://s-file-2.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json";
@@ -23,7 +23,7 @@ struct TextbookResource {
     local_state: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CatalogResponse {
     resources: Vec<TextbookResource>,
@@ -233,22 +233,30 @@ async fn fetch_catalog() -> Result<Vec<TextbookResource>, String> {
         .json()
         .await
         .map_err(|error| error.to_string())?;
-    let mut resources = Vec::new();
-    for url in string_at(&version, &["urls"])
+    let urls: Vec<String> = string_at(&version, &["urls"])
         .split(',')
         .map(str::trim)
         .filter(|url| !url.is_empty())
-    {
-        let part: Value = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?
-            .error_for_status()
-            .map_err(|error| error.to_string())?
-            .json()
-            .await
-            .map_err(|error| error.to_string())?;
+        .map(str::to_string)
+        .collect();
+    let parts = futures_util::future::try_join_all(urls.into_iter().map(|url| {
+        let client = client.clone();
+        async move {
+            client
+                .get(url)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?
+                .error_for_status()
+                .map_err(|error| error.to_string())?
+                .json::<Value>()
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }))
+    .await?;
+    let mut resources = Vec::new();
+    for part in parts {
         if let Some(items) = part.as_array() {
             resources.extend(items.iter().filter_map(normalize_resource));
         }
@@ -322,33 +330,46 @@ fn cookie_window(app: &tauri::AppHandle) -> Result<WebviewWindow, String> {
 }
 
 #[tauri::command]
-async fn load_catalog(state: tauri::State<'_, AppState>) -> Result<CatalogResponse, String> {
-    match fetch_catalog().await {
-        Ok(resources) => {
-            let response = CatalogResponse {
-                resources,
-                source: "official".into(),
-                cached_at: now_string(),
-                warning: None,
-            };
-            if let Some(parent) = state.catalog_cache_path.parent() {
-                let _ = fs::create_dir_all(parent);
+async fn load_catalog(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<CatalogResponse, String> {
+    let cached = fs::read_to_string(&state.catalog_cache_path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<CatalogResponse>(&json).ok())
+        .filter(|response| !response.resources.is_empty());
+    if let Some(mut response) = cached {
+        response.source = "cache".into();
+        response.warning = None;
+        let cache_path = state.catalog_cache_path.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Ok(resources) = fetch_catalog().await {
+                let refreshed = CatalogResponse {
+                    resources,
+                    source: "official".into(),
+                    cached_at: now_string(),
+                    warning: None,
+                };
+                if let Ok(json) = serde_json::to_string(&refreshed) {
+                    let _ = fs::write(cache_path, json);
+                }
+                let _ = app.emit("catalog:updated", refreshed);
             }
-            if let Ok(json) = serde_json::to_string(&response) {
-                let _ = fs::write(&state.catalog_cache_path, json);
-            }
-            Ok(response)
-        }
-        Err(error) => {
-            let cached =
-                fs::read_to_string(&state.catalog_cache_path).map_err(|_| error.clone())?;
-            let mut response: CatalogResponse =
-                serde_json::from_str(&cached).map_err(|_| error.clone())?;
-            response.source = "cache".into();
-            response.warning = Some(error);
-            Ok(response)
-        }
+        });
+        return Ok(response);
     }
+
+    let resources = fetch_catalog().await?;
+    let response = CatalogResponse {
+        resources,
+        source: "official".into(),
+        cached_at: now_string(),
+        warning: None,
+    };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = fs::write(&state.catalog_cache_path, json);
+    }
+    Ok(response)
 }
 
 #[tauri::command]

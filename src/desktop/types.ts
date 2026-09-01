@@ -21,6 +21,7 @@ export type QueueTask = {
 export type HistoryBatch = { id: string; status: QueueStatus; createdAt?: string; updatedAt?: string; tasks: QueueTask[] };
 export type QueueState = { batchId: string | null; status: QueueStatus; createdAt?: string; tasks: QueueTask[]; history: HistoryBatch[] };
 export type DownloadProgress = { taskId: string; contentId: string; phase: string; message: string; receivedBytes?: number; totalBytes?: number };
+export type CatalogResult = { resources: TextbookResource[]; source: string; warning?: string };
 export type LibraryItem = {
   contentId: string;
   title: string;
@@ -53,7 +54,7 @@ export type AppSettings = {
 
 export type TextbookBridge = {
   appVersion?: string;
-  loadCatalog?: () => Promise<{ resources: TextbookResource[]; source: string; warning?: string }>;
+  loadCatalog?: () => Promise<CatalogResult>;
   getSessionStatus?: () => Promise<{ hasSavedSession: boolean }>;
   login?: () => Promise<{ hasSavedSession: boolean; autoClosed?: boolean }>;
   clearSession?: () => Promise<{ hasSavedSession: boolean }>;
@@ -77,5 +78,6 @@ export type TextbookBridge = {
   clearAllTaskRecords?: () => Promise<QueueState>;
   onDownloadProgress?: (listener: (progress: DownloadProgress) => void) => () => void;
   onDownloadQueue?: (listener: (state: QueueState) => void) => () => void;
+  onCatalogUpdated?: (listener: (catalog: CatalogResult) => void) => () => void;
 };
 

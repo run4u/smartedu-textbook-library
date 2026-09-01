@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { TextbookResource } from '../data/fixtures';
-import type { AppSettings, DownloadProgress, LibraryItem, QueueState, TextbookBridge } from './types';
+import type { AppSettings, CatalogResult, DownloadProgress, LibraryItem, QueueState, TextbookBridge } from './types';
 
 declare global {
   interface Window {
@@ -41,6 +41,7 @@ const tauriBridge: TextbookBridge = {
   showLibraryInFolder: (filePath: string) => invoke<{ ok: boolean }>('show_library_in_folder', { filePath }),
   onDownloadProgress: (listener: (progress: DownloadProgress) => void) => eventSubscription('download:progress', listener),
   onDownloadQueue: (listener: (state: QueueState) => void) => eventSubscription('download:queue', listener),
+  onCatalogUpdated: (listener: (catalog: CatalogResult) => void) => eventSubscription('catalog:updated', listener),
 };
 
 export function desktopBridge(): TextbookBridge | undefined {

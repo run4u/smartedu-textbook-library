@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { CheckCircle2, Download, FileText, FolderOpen, LoaderCircle, LogIn, LogOut, PanelLeftClose, PanelLeftOpen, Pause, Play, RefreshCw, Search, Settings, Trash2, X } from 'lucide-react';
-import { resources, type TextbookResource } from './data/fixtures';
+import type { TextbookResource } from './data/fixtures';
 import { desktopBridge as bridge } from './desktop/bridge';
-import type { AppSettings, AppView, DownloadProgress, LibraryItem, QueueState, QueueTask, TaskStatus } from './desktop/types';
+import type { AppSettings, AppView, CatalogResult, DownloadProgress, LibraryItem, QueueState, QueueTask, TaskStatus } from './desktop/types';
 import { computeFilterOptions, filterFields, filterResources, groupResources, getSelectableResources, toggleAllSelection, toggleSkipDownloaded } from './lib/catalog';
 import './styles.css';
 
@@ -77,7 +77,7 @@ function batchPercent(tasks: QueueTask[]): number | null {
 
 function App() {
   const [view, setView] = useState<AppView>('catalog');
-  const [catalog, setCatalog] = useState(resources);
+  const [catalog, setCatalog] = useState<TextbookResource[]>([]);
   const [catalogStatus, setCatalogStatus] = useState('正在加载官方目录');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState('');
@@ -100,12 +100,9 @@ function App() {
   const settingsUpdateId = useRef(0);
   const lastProgressBytes = useRef<Record<string, { bytes: number; time: number }>>({});
 
-  const loadCatalogData = async () => {
-    try {
-      const desktopBridge = bridge();
-      const result = desktopBridge?.loadCatalog ? await desktopBridge.loadCatalog() : await (await fetch('/api/catalog')).json();
-      if (!Array.isArray(result.resources)) throw new Error(result.error || '目录格式异常');
-      setCatalog(result.resources);
+  const applyCatalogData = (result: CatalogResult) => {
+    if (!Array.isArray(result.resources)) throw new Error('目录格式异常');
+    setCatalog(result.resources);
       if (skipDownloaded) {
         const downloadedIds = new Set<string>();
         for (const resource of result.resources as TextbookResource[]) {
@@ -117,8 +114,14 @@ function App() {
           return next;
         });
       }
-      setCatalogStatus(result.source === 'cache' ? '正在使用本地缓存目录' : '官方目录已刷新');
-    } catch { setCatalogStatus('官方目录暂不可用，正在展示本地样例'); }
+    setCatalogStatus(result.source === 'cache' ? '已加载本地目录，正在后台刷新' : '官方目录已刷新');
+  };
+  const loadCatalogData = async () => {
+    try {
+      const desktopBridge = bridge();
+      const result = desktopBridge?.loadCatalog ? await desktopBridge.loadCatalog() : await (await fetch('/api/catalog')).json();
+      applyCatalogData(result);
+    } catch { setCatalogStatus('官方目录暂不可用'); }
   };
   const loadSessionStatus = async () => {
     const desktopBridge = bridge();
@@ -144,6 +147,7 @@ function App() {
     const desktopBridge = bridge();
     if (desktopBridge?.downloadState) void desktopBridge.downloadState().then(setQueue).catch(() => {});
     const unsubscribeQueue = desktopBridge?.onDownloadQueue?.((state) => setQueue(state));
+    const unsubscribeCatalog = desktopBridge?.onCatalogUpdated?.((result) => applyCatalogData(result));
     const unsubscribeProgress = desktopBridge?.onDownloadProgress?.((progress) => {
       const nowMs = Date.now();
       const previous = lastProgressBytes.current[progress.taskId];
@@ -155,7 +159,7 @@ function App() {
       lastProgressBytes.current[progress.taskId] = { bytes: progress.receivedBytes ?? previous?.bytes ?? 0, time: nowMs };
       setQueue((current) => ({ ...current, tasks: current.tasks.map((task) => task.id === progress.taskId ? { ...task, phase: progress.phase, message: progress.message, receivedBytes: progress.receivedBytes, totalBytes: progress.totalBytes } : task) }));
     });
-    return () => { unsubscribeQueue?.(); unsubscribeProgress?.(); };
+    return () => { unsubscribeQueue?.(); unsubscribeProgress?.(); unsubscribeCatalog?.(); };
   }, []);
   useEffect(() => {
     if (queue.status === 'running' || queue.status === 'paused') queueWasActive.current = true;

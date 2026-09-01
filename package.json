@@ -24,7 +24,7 @@
     "test": "vitest run",
     "pack": "npm run build && electron-builder --win --dir",
     "dist": "npm run build && electron-builder --win",
-    "dist:mac:arm64": "npm run build && electron-builder --mac dmg zip --arm64"
+    "dist:mac:arm64": "npm run build && electron-builder --mac dmg zip --arm64 --publish never"
   },
   "devDependencies": {
     "@types/node": "26.4.0",

@@ -38,7 +38,9 @@ The development build supports the complete catalog, sign-in, download queue, an
 
 Windows x64 installer and portable packages are available from [GitHub Releases](https://github.com/run4u/smartedu-textbook-library/releases/tag/v0.1.2). Version `0.1.2` is published as a pre-release because the packages are not code-signed and some display and extended acceptance scenarios remain to be refined.
 
-Windows SmartScreen may show an “Unknown publisher” warning. Verify the SHA-256 checksums attached to the release before running a downloaded package. macOS binaries are not currently provided because the project has not yet completed macOS hardware testing, Apple signing, or notarization.
+Windows SmartScreen may show an “Unknown publisher” warning. Verify the SHA-256 checksums attached to the release before running a downloaded package.
+
+An unsigned and unnotarized macOS `0.1.3-alpha.1` experimental build is available for invited Apple Silicon (arm64) testing only. Intel Macs are not supported, and this artifact is not a formal release. See [macOS Apple Silicon Testing](docs/MACOS-ARM64-TESTING.md).
 
 ## Development
 
@@ -54,7 +56,7 @@ npm run dev
 
 On Windows, `启动桌面端.cmd` starts the desktop development build. Keep its terminal window open while the application is running.
 
-On macOS or Linux, run the commands above from a terminal. Packaged builds are currently Windows-only, and source-mode behavior on macOS and Linux still requires community testing.
+On macOS or Linux, run the commands above from a terminal. The experimental macOS package targets Apple Silicon (arm64) only; source and packaged behavior still require community testing on real hardware.
 
 Do not commit `.electron-data`, downloaded files, `.part` files, browser profiles, or local logs.
 
@@ -80,6 +82,7 @@ See [Privacy and Security](docs/PRIVACY.md) and [Security Policy](SECURITY.md).
 - [Remaining Work](docs/REMAINING-WORK.md)
 - [Technical Decisions](docs/DECISIONS.md)
 - [Testing Guide](docs/TESTING.md)
+- [macOS Apple Silicon Testing](docs/MACOS-ARM64-TESTING.md)
 - [Open Source Guide](docs/OPEN-SOURCE-GUIDE.md)
 
 ## Contributing

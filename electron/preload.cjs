@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('textbookLibrary', {
-  appVersion: '0.1.2',
+  appVersion: '0.1.3-alpha.1',
   loadCatalog: () => ipcRenderer.invoke('catalog:load'),
   getSessionStatus: () => ipcRenderer.invoke('session:status'),
   login: () => ipcRenderer.invoke('session:login'),

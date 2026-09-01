@@ -25,7 +25,7 @@
 2. 代码签名：消除 Windows SmartScreen“未知发布者”提示；需要代码签名证书（可先用自签名验证流程，正式发布再用真证书）。
 3. 确定 Windows 发布者名称，并在具备代码签名证书后写入对应的打包配置。
 4. 确定版本策略与发布流程：版本号规则、GitHub Releases、是否接入 `electron-updater` 自动更新。
-5. macOS 发布：先在真实 Mac 或 macOS CI 上完成源码运行和打包测试；正式分发前需要 Apple Developer 证书、签名和公证。
+5. macOS 发布：Apple Silicon arm64 实验包已接入 macOS CI；仍需真实设备验证。当前不支持 Intel Mac，正式分发前仍需要 Apple Developer 证书、签名和公证。
 
 ## 三、开源准备
 

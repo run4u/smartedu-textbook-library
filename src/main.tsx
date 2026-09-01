@@ -438,7 +438,7 @@ function SettingsPage({ settings, catalog, message, hasSavedSession, onUpdate, o
       <label className="settings-check"><input type="checkbox" checked={settings.defaultSkipDownloaded} onChange={(event) => onUpdate({ defaultSkipDownloaded: event.target.checked })} />默认跳过已下载资源</label>
       <label className="settings-select-label">默认进入页面<select className="settings-input" value={settings.defaultView} onChange={(event) => onUpdate({ defaultView: event.target.value as AppView })}><option value="catalog">教材目录</option><option value="tasks">下载任务</option><option value="library">本地资料</option><option value="settings">设置</option></select></label>
     </div>
-    <div className="settings-card"><div className="settings-card-head"><div><h2>应用与数据</h2><p>版本 {bridge()?.appVersion || '0.1.2'} · 登录档案和任务记录保存在本机。</p></div></div><div className="settings-actions"><button className="button secondary" onClick={onClearRecords}>清除全部下载任务记录</button><button className="button secondary" disabled={!hasSavedSession} onClick={onClearSession}>清除平台登录档案</button></div><p className="settings-help">清除记录或登录档案都不会删除已下载的教材文件。</p></div>
+    <div className="settings-card"><div className="settings-card-head"><div><h2>应用与数据</h2><p>版本 {bridge()?.appVersion || '0.1.3-alpha.1'} · 登录档案和任务记录保存在本机。</p></div></div><div className="settings-actions"><button className="button secondary" onClick={onClearRecords}>清除全部下载任务记录</button><button className="button secondary" disabled={!hasSavedSession} onClick={onClearSession}>清除平台登录档案</button></div><p className="settings-help">清除记录或登录档案都不会删除已下载的教材文件。</p></div>
   </section>;
 }
 

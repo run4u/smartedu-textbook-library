@@ -38,7 +38,9 @@ SmartEdu Textbook Library 是一个本地优先的桌面应用，用于查找、
 
 Windows x64 安装版和便携版可从 [GitHub Releases](https://github.com/run4u/smartedu-textbook-library/releases/tag/v0.1.2) 下载。`0.1.2` 以预发布版提供，因为安装包尚未进行代码签名，少量展示问题和扩展验收场景仍待后续完善。
 
-Windows SmartScreen 可能显示“未知发布者”提示，运行前请核对 Release 附件中的 SHA-256 校验值。项目目前不提供 macOS 二进制包，因为尚未完成真实 Mac 设备测试、Apple 代码签名和公证。
+Windows SmartScreen 可能显示“未知发布者”提示，运行前请核对 Release 附件中的 SHA-256 校验值。
+
+项目提供仅面向 Apple Silicon（arm64）的 macOS `0.1.3-alpha.1` 实验包构建，不支持 Intel Mac。该包未进行 Apple 代码签名和公证，不属于正式发行版，只用于邀请测试；获取和测试方法见 [macOS Apple Silicon 实验包测试](docs/MACOS-ARM64-TESTING.md)。
 
 ## 开发运行
 
@@ -54,7 +56,7 @@ npm run dev
 
 Windows 用户也可以双击仓库根目录的 `启动桌面端.cmd`。开发版运行时请保持命令行窗口打开。
 
-macOS 和 Linux 用户可直接在终端运行上述命令。当前只支持生成 Windows 打包版，macOS/Linux 的源码运行仍需要社区实际测试。
+macOS 和 Linux 用户可直接在终端运行上述命令。macOS 实验包只构建 Apple Silicon（arm64），源码运行和打包行为仍需要社区在真实设备上测试。
 
 请勿提交 `.electron-data`、已下载文件、`.part` 文件、浏览器档案或本地日志。
 
@@ -80,6 +82,7 @@ macOS 和 Linux 用户可直接在终端运行上述命令。当前只支持生�
 - [剩余工作清单](docs/REMAINING-WORK.md)
 - [技术决策记录](docs/DECISIONS.md)
 - [测试指南](docs/TESTING.md)
+- [macOS Apple Silicon 实验包测试](docs/MACOS-ARM64-TESTING.md)
 - [开源规范](docs/OPEN-SOURCE-GUIDE.md)
 
 ## 参与贡献

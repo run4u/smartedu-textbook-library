@@ -30,5 +30,6 @@
 - [x] Fixture-based unit tests
 - [ ] IPC and packaged-app integration tests
 - [x] Windows installer and portable build (unsigned)
-- [ ] macOS hardware testing, signing, and notarized distribution
+- [x] Unsigned Apple Silicon arm64 experimental packaging
+- [ ] Apple Silicon hardware testing, signing, and notarized distribution
 - [ ] Optional PDF bookmark enrichment

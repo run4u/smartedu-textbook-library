@@ -1,4 +1,3 @@
-use futures_util::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,8 +11,10 @@ use std::{
     },
     time::Duration,
 };
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tauri::{
+    webview::DownloadEvent, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+};
+use tokio::io::AsyncReadExt;
 
 const VERSION_URL: &str =
     "https://s-file-2.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json";
@@ -72,6 +73,15 @@ const READ_DETAIL_PROBE_SCRIPT: &str = r#"
 })()
 "#;
 
+const READ_BROWSER_DOWNLOAD_SCRIPT: &str = r#"
+(() => window.__smarteduLiteDownload || {
+  status: 'waiting',
+  loaded: 0,
+  total: 0,
+  error: ''
+})()
+"#;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TextbookResource {
@@ -87,6 +97,20 @@ struct TextbookResource {
     update_time: String,
     size_bytes: u64,
     local_state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserDownloadProbe {
+    status: String,
+    loaded: u64,
+    total: u64,
+    error: String,
+}
+
+struct BrowserDownloadFinished {
+    path: Option<PathBuf>,
+    success: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -601,14 +625,42 @@ async fn resolve_pdf(
     app: &tauri::AppHandle,
     resource: &TextbookResource,
     signal: &Arc<AtomicU8>,
-) -> Result<(String, String, WebviewWindow), DownloadFailure> {
+    download_target: PathBuf,
+) -> Result<
+    (
+        String,
+        String,
+        WebviewWindow,
+        tokio::sync::oneshot::Receiver<BrowserDownloadFinished>,
+    ),
+    DownloadFailure,
+> {
     let label = format!("smartedu-detail-{}", now_string());
     let detail = detail_url(resource).map_err(DownloadFailure::Failed)?;
+    let (download_sender, download_receiver) = tokio::sync::oneshot::channel();
+    let download_sender = Arc::new(Mutex::new(Some(download_sender)));
+    let callback_target = download_target.clone();
     let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(detail))
         .title("正在解析教材详情")
         .visible(false)
         .initialization_script(DETAIL_PROBE_SCRIPT)
         .on_navigation(is_platform_url)
+        .on_download(move |_webview, event| {
+            match event {
+                DownloadEvent::Requested { destination, .. } => {
+                    *destination = callback_target.clone();
+                }
+                DownloadEvent::Finished { path, success, .. } => {
+                    if let Ok(mut sender) = download_sender.lock() {
+                        if let Some(sender) = sender.take() {
+                            let _ = sender.send(BrowserDownloadFinished { path, success });
+                        }
+                    }
+                }
+                _ => {}
+            }
+            true
+        })
         .build()
         .map_err(|error| DownloadFailure::Failed(format!("创建教材详情窗口失败：{error}")))?;
     let result = async {
@@ -640,7 +692,7 @@ async fn resolve_pdf(
     }
     .await;
     match result {
-        Ok((pdf_url, auth)) => Ok((pdf_url, auth, window)),
+        Ok((pdf_url, auth)) => Ok((pdf_url, auth, window, download_receiver)),
         Err(error) => {
             let _ = window.close();
             Err(error)
@@ -648,18 +700,79 @@ async fn resolve_pdf(
     }
 }
 
-fn cookie_header_for_url(window: &WebviewWindow, url: &str) -> Result<String, String> {
-    let url = tauri::Url::parse(url).map_err(|error| error.to_string())?;
+async fn read_browser_download_probe(
+    window: &WebviewWindow,
+) -> Result<BrowserDownloadProbe, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let sender = Mutex::new(Some(sender));
     window
-        .cookies_for_url(url)
-        .map_err(|error| error.to_string())
-        .map(|cookies| {
-            cookies
-                .iter()
-                .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
-                .collect::<Vec<_>>()
-                .join("; ")
+        .eval_with_callback(READ_BROWSER_DOWNLOAD_SCRIPT, move |result| {
+            if let Ok(mut sender) = sender.lock() {
+                if let Some(sender) = sender.take() {
+                    let _ = sender.send(result);
+                }
+            }
         })
+        .map_err(|error| error.to_string())?;
+    let result = tokio::time::timeout(Duration::from_secs(5), receiver)
+        .await
+        .map_err(|_| "读取浏览器下载状态超时".to_string())?
+        .map_err(|_| "教材详情窗口提前关闭".to_string())?;
+    serde_json::from_str(&result).map_err(|error| format!("浏览器下载状态格式异常：{error}"))
+}
+
+fn start_browser_download(window: &WebviewWindow, pdf_url: &str, auth: &str) -> Result<(), String> {
+    let pdf_url = serde_json::to_string(pdf_url).map_err(|error| error.to_string())?;
+    let auth = serde_json::to_string(auth).map_err(|error| error.to_string())?;
+    let script = format!(
+        r#"
+(() => {{
+  const state = window.__smarteduLiteDownload = {{
+    status: 'fetching', loaded: 0, total: 0, error: ''
+  }};
+  const request = new XMLHttpRequest();
+  request.open('GET', {pdf_url}, true);
+  request.responseType = 'blob';
+  request.withCredentials = true;
+  const auth = {auth};
+  if (auth) request.setRequestHeader('X-Nd-Auth', auth);
+  request.onprogress = (event) => {{
+    state.loaded = Number(event.loaded || 0);
+    state.total = Number(event.lengthComputable ? event.total : 0);
+  }};
+  request.onerror = () => {{
+    state.status = 'error';
+    state.error = '浏览器请求 PDF 失败，请检查网络后重试';
+  }};
+  request.onabort = () => {{
+    state.status = 'error';
+    state.error = '浏览器下载已中断';
+  }};
+  request.onload = () => {{
+    if (request.status < 200 || request.status >= 300) {{
+      state.status = 'error';
+      state.error = `浏览器请求 PDF 失败：HTTP ${{request.status}}`;
+      return;
+    }}
+    state.loaded = request.response.size;
+    if (!state.total) state.total = request.response.size;
+    state.status = 'saving';
+    const objectUrl = URL.createObjectURL(request.response);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = 'textbook.pdf';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+  }};
+  request.send();
+  return true;
+}})()
+"#
+    );
+    window.eval(&script).map_err(|error| error.to_string())
 }
 
 fn sanitize_filename(value: &str) -> String {
@@ -798,13 +911,6 @@ async fn download_single(
         None,
         None,
     );
-    let (pdf_url, auth, detail_window) = resolve_pdf(&app, &resource, &signal).await?;
-    let cookie = cookie_header_for_url(&detail_window, &pdf_url).unwrap_or_default();
-    let _ = detail_window.close();
-    let directive = signal.load(Ordering::Relaxed);
-    if directive != DOWNLOAD_RUNNING {
-        return Err(DownloadFailure::Interrupted(directive));
-    }
     let settings = app
         .state::<AppState>()
         .settings
@@ -817,113 +923,74 @@ async fn download_single(
         .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
     let target = directory.join(output_filename(&resource, &settings.filename_template));
     let part = PathBuf::from(format!("{}.part", target.to_string_lossy()));
-    let part_size = tokio::fs::metadata(&part)
-        .await
-        .map(|metadata| metadata.len())
-        .unwrap_or_default();
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
-    let mut request = client.get(&pdf_url).header(
-        reqwest::header::REFERER,
-        detail_url(&resource)
-            .map_err(DownloadFailure::Failed)?
-            .to_string(),
-    );
-    if !auth.is_empty() {
-        request = request.header("X-Nd-Auth", auth);
-    }
-    if !cookie.is_empty() {
-        request = request.header(reqwest::header::COOKIE, cookie);
-    }
-    if part_size > 0 {
-        request = request.header(reqwest::header::RANGE, format!("bytes={part_size}-"));
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| DownloadFailure::Failed(format!("下载请求失败：{error}")))?;
-    if !response.status().is_success() {
-        return Err(DownloadFailure::Failed(format!(
-            "下载请求失败：HTTP {}",
-            response.status()
-        )));
-    }
-    let resumed = part_size > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-    if part_size > 0 && !resumed {
-        let _ = tokio::fs::remove_file(&part).await;
-    }
-    let remaining = response.content_length().unwrap_or_default();
-    let base = if resumed { part_size } else { 0 };
-    let total = if remaining > 0 {
-        base + remaining
-    } else {
-        resource.size_bytes
-    };
+    let _ = tokio::fs::remove_file(&part).await;
+    let (pdf_url, auth, detail_window, mut download_receiver) =
+        resolve_pdf(&app, &resource, &signal, part.clone()).await?;
+    start_browser_download(&detail_window, &pdf_url, &auth).map_err(DownloadFailure::Failed)?;
     report_progress(
         &app,
         &task_id,
         "downloading",
-        if resumed {
-            "继续下载"
-        } else {
-            "正在下载"
-        },
-        Some(base),
-        Some(total),
+        "正在通过登录页面下载",
+        Some(0),
+        (resource.size_bytes > 0).then_some(resource.size_bytes),
     );
-    let mut output = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(resumed)
-        .truncate(!resumed)
-        .open(&part)
-        .await
-        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
-    let mut stream = response.bytes_stream();
-    let mut received = base;
-    let mut last_reported = base;
-    while let Some(chunk) = stream.next().await {
+    let finished = loop {
         let directive = signal.load(Ordering::Relaxed);
         if directive != DOWNLOAD_RUNNING {
-            output
-                .flush()
-                .await
-                .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
-            drop(output);
+            let _ = detail_window.close();
             if directive == DOWNLOAD_CANCELED {
                 let _ = tokio::fs::remove_file(&part).await;
             }
             return Err(DownloadFailure::Interrupted(directive));
         }
-        let chunk = chunk.map_err(|error| DownloadFailure::Failed(format!("下载中断：{error}")))?;
-        output
-            .write_all(&chunk)
-            .await
-            .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
-        received += chunk.len() as u64;
-        if received.saturating_sub(last_reported) >= 256 * 1024 {
-            last_reported = received;
+        match download_receiver.try_recv() {
+            Ok(finished) => break finished,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                let _ = detail_window.close();
+                return Err(DownloadFailure::Failed("浏览器下载窗口提前关闭".into()));
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+        if let Ok(probe) = read_browser_download_probe(&detail_window).await {
+            if probe.status == "error" {
+                let _ = detail_window.close();
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(DownloadFailure::Failed(probe.error));
+            }
             report_progress(
                 &app,
                 &task_id,
                 "downloading",
-                if resumed {
-                    "继续下载"
+                if probe.status == "saving" {
+                    "正在保存教材文件"
                 } else {
-                    "正在下载"
+                    "正在通过登录页面下载"
                 },
-                Some(received),
-                Some(total),
+                Some(probe.loaded),
+                (probe.total > 0)
+                    .then_some(probe.total)
+                    .or((resource.size_bytes > 0).then_some(resource.size_bytes)),
             );
         }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let _ = detail_window.close();
+    if !finished.success {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(DownloadFailure::Failed("浏览器未能完成 PDF 下载".into()));
     }
-    output
-        .flush()
+    let downloaded_path = finished.path.unwrap_or_else(|| part.clone());
+    if downloaded_path != part && tokio::fs::metadata(&part).await.is_err() {
+        tokio::fs::rename(&downloaded_path, &part)
+            .await
+            .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
+    }
+    let received = tokio::fs::metadata(&part)
         .await
-        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
-    drop(output);
+        .map_err(|error| DownloadFailure::Failed(format!("未找到浏览器下载文件：{error}")))?
+        .len();
+    let total = resource.size_bytes.max(received);
     let directive = signal.load(Ordering::Relaxed);
     if directive != DOWNLOAD_RUNNING {
         if directive == DOWNLOAD_CANCELED {

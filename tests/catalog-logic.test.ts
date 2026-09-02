@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeFilterOptions, filterResources, getSelectableResources, groupResources, toggleAllSelection, toggleSkipDownloaded } from '../src/lib/catalog';
+import { computeFilterOptions, filterResources, getSelectableResources, getSelectedResources, groupResources, toggleAllSelection, toggleSkipDownloaded } from '../src/lib/catalog';
 
 type Patch = Partial<{ title: string; stage: string; subject: string; grade: string; volume: string; edition: string; resourceYear: string; localState: 'downloaded' | 'not-downloaded' }>;
 
@@ -66,6 +66,13 @@ describe('selection helpers', () => {
     const catalog = [make('a', { localState: 'downloaded' }), make('b')];
     expect(getSelectableResources(catalog, true).map((resource) => resource.contentId)).toEqual(['b']);
     expect(getSelectableResources(catalog, false)).toHaveLength(2);
+  });
+
+  it('getSelectedResources enforces skip downloaded when submitting a batch', () => {
+    const catalog = [make('a', { localState: 'downloaded' }), make('b')];
+    const selected = new Set(['a', 'b']);
+    expect(getSelectedResources(catalog, selected, true).map((resource) => resource.contentId)).toEqual(['b']);
+    expect(getSelectedResources(catalog, selected, false).map((resource) => resource.contentId)).toEqual(['a', 'b']);
   });
 
   it('toggleAllSelection selects then clears the given list', () => {

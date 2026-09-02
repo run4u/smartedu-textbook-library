@@ -29,6 +29,10 @@ export function getSelectableResources(resources: TextbookResource[], skipDownlo
   return skipDownloaded ? resources.filter((resource) => resource.localState !== 'downloaded') : resources;
 }
 
+export function getSelectedResources(resources: TextbookResource[], selected: ReadonlySet<string>, skipDownloaded: boolean): TextbookResource[] {
+  return getSelectableResources(resources.filter((resource) => selected.has(resource.contentId)), skipDownloaded);
+}
+
 export function toggleAllSelection(current: Set<string>, selectable: TextbookResource[], allSelected: boolean): Set<string> {
   const next = new Set(current);
   if (allSelected) selectable.forEach((resource) => next.delete(resource.contentId));

@@ -4,7 +4,7 @@ import { CheckCircle2, Download, FileText, FolderOpen, LoaderCircle, LogIn, LogO
 import type { TextbookResource } from './data/fixtures';
 import { desktopBridge as bridge } from './desktop/bridge';
 import type { AppSettings, AppView, CatalogResult, DownloadProgress, LibraryItem, QueueState, QueueTask, TaskStatus } from './desktop/types';
-import { computeFilterOptions, filterFields, filterResources, groupResources, getSelectableResources, toggleAllSelection, toggleSkipDownloaded } from './lib/catalog';
+import { computeFilterOptions, filterFields, filterResources, getSelectedResources, groupResources, getSelectableResources, toggleAllSelection, toggleSkipDownloaded } from './lib/catalog';
 import './styles.css';
 
 function formatSize(bytes: number): string {
@@ -211,9 +211,14 @@ function App() {
 
   const startBatch = async (resourcesToDownload: TextbookResource[]) => {
     const desktopBridge = bridge();
-    if (!desktopBridge?.startDownload || resourcesToDownload.length === 0) return;
+    if (!desktopBridge?.startDownload) return;
+    const eligibleResources = getSelectableResources(resourcesToDownload, skipDownloaded);
+    if (eligibleResources.length === 0) {
+      setBatchNotice(skipDownloaded ? '所选教材均已下载；如需重新下载，请先取消“跳过已下载”' : '请至少选择一本教材');
+      return;
+    }
     if (!hasSavedSession) { setBatchNotice('尚未登录，请先登录平台'); return; }
-    try { setBatchNotice(''); setQueue(await desktopBridge.startDownload(resourcesToDownload)); }
+    try { setBatchNotice(''); setQueue(await desktopBridge.startDownload(eligibleResources)); }
     catch (error) { setBatchNotice(error instanceof Error ? error.message : String(error)); }
   };
   const pauseBatch = async () => { const desktopBridge = bridge(); if (desktopBridge?.pauseDownload) setQueue(await desktopBridge.pauseDownload()); };
@@ -254,7 +259,7 @@ function App() {
   const selectableResources = getSelectableResources(matching, skipDownloaded);
   const allVisibleSelected = selectableResources.length > 0 && selectableResources.every((resource) => selected.has(resource.contentId));
   const selectedDownloaded = catalog.filter((resource) => selected.has(resource.contentId) && resource.localState === 'downloaded').length;
-  const selectedResources = useMemo(() => catalog.filter((resource) => selected.has(resource.contentId)), [catalog, selected]);
+  const selectedResources = useMemo(() => getSelectedResources(catalog, selected, skipDownloaded), [catalog, selected, skipDownloaded]);
   const downloadCount = selectedResources.length;
 
   const toggleResource = (id: string) => setSelected((current) => {
@@ -322,7 +327,7 @@ function App() {
         </section>
         {batchNotice && <div className="batch-notice">{batchNotice}</div>}
         <section className="catalog-tree" id="catalog"><table><colgroup><col className="category-col" /><col className="title-col" /><col className="year-col" /><col className="size-col" /><col className="updated-col" /><col className="id-col" /><col className="state-col" /><col className="action-col" /></colgroup><thead><tr><th>分类</th><th>教材名称</th><th>资源年度</th><th>文件大小</th><th>更新时间</th><th>资源身份</th><th>本地状态</th><th></th></tr></thead><tbody>{groups.map(([key, group]) => <TextbookGroup key={key} groupKey={key} resources={group} selected={selected} skipDownloaded={skipDownloaded} onToggleResource={toggleResource} taskByContentId={taskByContentId} batchActive={batchActive} onDownload={(resource) => void startBatch([resource])} />)}</tbody></table></section>
-        <section className="notice"><CheckCircle2 size={19} /><div><strong>版本不会自动合并</strong><span>资源年度、时间、文件大小和内容 ID 会并列保存；“已下载”仅作提示，不会阻止再次下载。</span></div></section>
+        <section className="notice"><CheckCircle2 size={19} /><div><strong>版本不会自动合并</strong><span>资源年度、时间、文件大小和内容 ID 会并列保存；启用“跳过已下载”时不会覆盖已有文件，需要重新下载时请先取消该选项。</span></div></section>
       </>}
 
       {view === 'tasks' && <section className="tasks-page">

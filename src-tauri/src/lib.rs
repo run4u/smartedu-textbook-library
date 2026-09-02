@@ -643,9 +643,10 @@ async fn resolve_pdf(
     }
 }
 
-fn cookie_header_for_window(window: &WebviewWindow) -> Result<String, String> {
+fn cookie_header_for_url(window: &WebviewWindow, url: &str) -> Result<String, String> {
+    let url = tauri::Url::parse(url).map_err(|error| error.to_string())?;
     window
-        .cookies()
+        .cookies_for_url(url)
         .map_err(|error| error.to_string())
         .map(|cookies| {
             cookies
@@ -793,10 +794,7 @@ async fn download_single(
         None,
     );
     let (pdf_url, auth, detail_window) = resolve_pdf(&app, &resource, &signal).await?;
-    // The authentication cookies are commonly scoped to smartedu.cn while the
-    // resolved PDF is served from a different CDN host. Reading all cookies
-    // from the authenticated WebView preserves that cross-host session.
-    let cookie = cookie_header_for_window(&detail_window).unwrap_or_default();
+    let cookie = cookie_header_for_url(&detail_window, &pdf_url).unwrap_or_default();
     let _ = detail_window.close();
     let directive = signal.load(Ordering::Relaxed);
     if directive != DOWNLOAD_RUNNING {
@@ -848,6 +846,11 @@ async fn download_single(
         .send()
         .await
         .map_err(|error| DownloadFailure::Failed(format!("下载请求失败：{error}")))?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(DownloadFailure::Failed(
+            "登录会话已失效，请重新登录平台后重试".into(),
+        ));
+    }
     if !response.status().is_success() {
         return Err(DownloadFailure::Failed(format!(
             "下载请求失败：HTTP {}",
@@ -1122,6 +1125,8 @@ async fn open_login(app: tauri::AppHandle) -> Result<SessionStatus, String> {
         .map_err(|error| error.to_string())?;
     }
     let mut auto_closed = false;
+    let mut first_new_credential_at: Option<std::time::Instant> = None;
+    let mut stable_polls = 0_u8;
     while app.get_webview_window("smartedu-login").is_some() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let Some(window) = app.get_webview_window("smartedu-login") else {
@@ -1134,8 +1139,21 @@ async fn open_login(app: tauri::AppHandle) -> Result<SessionStatus, String> {
             .iter()
             .any(|(key, value)| baseline.get(key) != Some(value));
         if has_new_credential {
-            auto_closed = true;
-            window.close().map_err(|error| error.to_string())?;
+            first_new_credential_at.get_or_insert_with(std::time::Instant::now);
+            stable_polls = stable_polls.saturating_add(1);
+            // Login often writes several HttpOnly cookies in succession. Wait
+            // until the credential set has remained present for a few polls so
+            // the window is not closed after the first intermediate cookie.
+            if stable_polls >= 3
+                && first_new_credential_at
+                    .is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
+            {
+                auto_closed = true;
+                window.close().map_err(|error| error.to_string())?;
+            }
+        } else {
+            first_new_credential_at = None;
+            stable_polls = 0;
         }
     }
     let mut status = session_status(app).await?;

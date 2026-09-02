@@ -19,37 +19,28 @@ const VERSION_URL: &str =
     "https://s-file-2.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json";
 const DETAIL_PROBE_SCRIPT: &str = r#"
 (() => {
-  const state = window.__smarteduLiteProbe = window.__smarteduLiteProbe || { auth: '', urls: [], authByUrl: {} };
+  const state = window.__smarteduLiteProbe = window.__smarteduLiteProbe || { auth: '', urls: [] };
   const rememberUrl = (value) => {
     try {
-      const raw = typeof value === 'string' ? value : value && value.url;
-      const url = raw ? new URL(raw, location.href).toString() : '';
+      const url = typeof value === 'string' ? value : value && value.url;
       if (url && !state.urls.includes(url)) state.urls.push(url);
-      return url;
     } catch (_) {}
-    return '';
   };
-  const rememberHeaders = (headers, url) => {
+  const rememberHeaders = (headers) => {
     try {
       new Headers(headers || {}).forEach((value, name) => {
-        if (name.toLowerCase() === 'x-nd-auth' && value) {
-          state.auth = value;
-          if (url) state.authByUrl[url] = value;
-        }
+        if (name.toLowerCase() === 'x-nd-auth' && value) state.auth = value;
       });
     } catch (_) {}
   };
   const originalFetch = window.fetch;
   if (originalFetch && !originalFetch.__smarteduLiteWrapped) {
     const wrappedFetch = function(input, init) {
-      const requestUrl = rememberUrl(input);
-      rememberHeaders(input && input.headers, requestUrl);
-      rememberHeaders(init && init.headers, requestUrl);
+      rememberUrl(input);
+      rememberHeaders(input && input.headers);
+      rememberHeaders(init && init.headers);
       return originalFetch.apply(this, arguments).then((response) => {
-        const responseUrl = rememberUrl(response && response.url);
-        if (requestUrl && responseUrl && state.authByUrl[requestUrl]) {
-          state.authByUrl[responseUrl] = state.authByUrl[requestUrl];
-        }
+        rememberUrl(response && response.url);
         return response;
       });
     };
@@ -59,14 +50,11 @@ const DETAIL_PROBE_SCRIPT: &str = r#"
   const originalOpen = XMLHttpRequest.prototype.open;
   const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
   XMLHttpRequest.prototype.open = function(method, url) {
-    this.__smarteduLiteUrl = rememberUrl(url);
+    rememberUrl(url);
     return originalOpen.apply(this, arguments);
   };
   XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
-    if (String(name).toLowerCase() === 'x-nd-auth' && value) {
-      state.auth = String(value);
-      if (this.__smarteduLiteUrl) state.authByUrl[this.__smarteduLiteUrl] = String(value);
-    }
+    if (String(name).toLowerCase() === 'x-nd-auth' && value) state.auth = String(value);
     return originalSetHeader.apply(this, arguments);
   };
 })();
@@ -74,12 +62,11 @@ const DETAIL_PROBE_SCRIPT: &str = r#"
 
 const READ_DETAIL_PROBE_SCRIPT: &str = r#"
 (() => {
-  const state = window.__smarteduLiteProbe || { auth: '', urls: [], authByUrl: {} };
+  const state = window.__smarteduLiteProbe || { auth: '', urls: [] };
   const performanceUrls = performance.getEntriesByType('resource').map((entry) => entry.name);
   return {
     html: document.documentElement ? document.documentElement.outerHTML : '',
     auth: state.auth || '',
-    authByUrl: state.authByUrl || {},
     urls: Array.from(new Set([...(state.urls || []), ...performanceUrls]))
   };
 })()
@@ -219,8 +206,6 @@ struct LibraryItem {
 struct DetailProbe {
     html: String,
     auth: String,
-    #[serde(default)]
-    auth_by_url: HashMap<String, String>,
     urls: Vec<String>,
 }
 
@@ -593,23 +578,6 @@ fn find_pdf_url(text: &str, content_id: &str) -> Option<String> {
     None
 }
 
-fn auth_candidates_for_pdf(probe: &DetailProbe, pdf_url: &str, content_id: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Some(auth) = probe.auth_by_url.get(pdf_url) {
-        candidates.push(auth.clone());
-    }
-    for (url, auth) in &probe.auth_by_url {
-        if url.contains(content_id) && !candidates.contains(auth) {
-            candidates.push(auth.clone());
-        }
-    }
-    if !probe.auth.is_empty() && !candidates.contains(&probe.auth) {
-        candidates.push(probe.auth.clone());
-    }
-    candidates.truncate(8);
-    candidates
-}
-
 async fn read_detail_probe(window: &WebviewWindow) -> Result<DetailProbe, String> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let sender = Mutex::new(Some(sender));
@@ -633,7 +601,7 @@ async fn resolve_pdf(
     app: &tauri::AppHandle,
     resource: &TextbookResource,
     signal: &Arc<AtomicU8>,
-) -> Result<(String, Vec<String>, WebviewWindow), DownloadFailure> {
+) -> Result<(String, String, WebviewWindow), DownloadFailure> {
     let label = format!("smartedu-detail-{}", now_string());
     let detail = detail_url(resource).map_err(DownloadFailure::Failed)?;
     let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(detail))
@@ -644,7 +612,8 @@ async fn resolve_pdf(
         .build()
         .map_err(|error| DownloadFailure::Failed(format!("创建教材详情窗口失败：{error}")))?;
     let result = async {
-        let mut resolved_pdf = None;
+        let mut last_url_count = 0;
+        let mut saw_auth = false;
         for _ in 0..24 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let directive = signal.load(Ordering::Relaxed);
@@ -655,30 +624,23 @@ async fn resolve_pdf(
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            let mut searchable = probe.html.clone();
+            last_url_count = probe.urls.len();
+            saw_auth |= !probe.auth.is_empty();
+            let mut searchable = probe.html;
             searchable.push('\n');
             searchable.push_str(&probe.urls.join("\n"));
-            if resolved_pdf.is_none() {
-                resolved_pdf = find_pdf_url(&searchable, &resource.content_id);
-            }
-            if let Some(pdf_url) = resolved_pdf.as_deref() {
-                let auth_candidates =
-                    auth_candidates_for_pdf(&probe, pdf_url, &resource.content_id);
-                if !auth_candidates.is_empty() {
-                    return Ok((pdf_url.to_string(), auth_candidates));
-                }
+            if let Some(pdf_url) = find_pdf_url(&searchable, &resource.content_id) {
+                return Ok((pdf_url, probe.auth));
             }
         }
-        if let Some(pdf_url) = resolved_pdf {
-            return Ok((pdf_url, Vec::new()));
-        }
-        Err(DownloadFailure::Failed(
-            "未能从教材详情解析到 PDF 地址，请确认登录状态和资源权限".to_string(),
-        ))
+        Err(DownloadFailure::Failed(format!(
+            "未能从教材详情解析到 PDF 地址（捕获请求 {last_url_count} 个，授权信息{}）；请确认登录状态和资源权限",
+            if saw_auth { "已出现" } else { "未出现" }
+        )))
     }
     .await;
     match result {
-        Ok((pdf_url, auth_candidates)) => Ok((pdf_url, auth_candidates, window)),
+        Ok((pdf_url, auth)) => Ok((pdf_url, auth, window)),
         Err(error) => {
             let _ = window.close();
             Err(error)
@@ -836,8 +798,7 @@ async fn download_single(
         None,
         None,
     );
-    let (pdf_url, mut auth_candidates, detail_window) =
-        resolve_pdf(&app, &resource, &signal).await?;
+    let (pdf_url, auth, detail_window) = resolve_pdf(&app, &resource, &signal).await?;
     let cookie = cookie_header_for_url(&detail_window, &pdf_url).unwrap_or_default();
     let _ = detail_window.close();
     let directive = signal.load(Ordering::Relaxed);
@@ -864,40 +825,25 @@ async fn download_single(
         .connect_timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
-    auth_candidates.push(String::new());
-    let referer = detail_url(&resource)
-        .map_err(DownloadFailure::Failed)?
-        .to_string();
-    let mut response = None;
-    for auth in auth_candidates {
-        let mut request = client
-            .get(&pdf_url)
-            .header(reqwest::header::REFERER, &referer);
-        if !auth.is_empty() {
-            request = request.header("X-Nd-Auth", auth);
-        }
-        if !cookie.is_empty() {
-            request = request.header(reqwest::header::COOKIE, &cookie);
-        }
-        if part_size > 0 {
-            request = request.header(reqwest::header::RANGE, format!("bytes={part_size}-"));
-        }
-        let candidate = request
-            .send()
-            .await
-            .map_err(|error| DownloadFailure::Failed(format!("下载请求失败：{error}")))?;
-        let unauthorized = candidate.status() == reqwest::StatusCode::UNAUTHORIZED;
-        response = Some(candidate);
-        if !unauthorized {
-            break;
-        }
+    let mut request = client.get(&pdf_url).header(
+        reqwest::header::REFERER,
+        detail_url(&resource)
+            .map_err(DownloadFailure::Failed)?
+            .to_string(),
+    );
+    if !auth.is_empty() {
+        request = request.header("X-Nd-Auth", auth);
     }
-    let response = response.expect("at least one download authorization candidate");
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(DownloadFailure::Failed(
-            "登录会话已失效，请重新登录平台后重试".into(),
-        ));
+    if !cookie.is_empty() {
+        request = request.header(reqwest::header::COOKIE, cookie);
     }
+    if part_size > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={part_size}-"));
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| DownloadFailure::Failed(format!("下载请求失败：{error}")))?;
     if !response.status().is_success() {
         return Err(DownloadFailure::Failed(format!(
             "下载请求失败：HTTP {}",
@@ -1172,8 +1118,6 @@ async fn open_login(app: tauri::AppHandle) -> Result<SessionStatus, String> {
         .map_err(|error| error.to_string())?;
     }
     let mut auto_closed = false;
-    let mut first_new_credential_at: Option<std::time::Instant> = None;
-    let mut stable_polls = 0_u8;
     while app.get_webview_window("smartedu-login").is_some() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let Some(window) = app.get_webview_window("smartedu-login") else {
@@ -1186,21 +1130,8 @@ async fn open_login(app: tauri::AppHandle) -> Result<SessionStatus, String> {
             .iter()
             .any(|(key, value)| baseline.get(key) != Some(value));
         if has_new_credential {
-            first_new_credential_at.get_or_insert_with(std::time::Instant::now);
-            stable_polls = stable_polls.saturating_add(1);
-            // Login often writes several HttpOnly cookies in succession. Wait
-            // until the credential set has remained present for a few polls so
-            // the window is not closed after the first intermediate cookie.
-            if stable_polls >= 3
-                && first_new_credential_at
-                    .is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
-            {
-                auto_closed = true;
-                window.close().map_err(|error| error.to_string())?;
-            }
-        } else {
-            first_new_credential_at = None;
-            stable_polls = 0;
+            auto_closed = true;
+            window.close().map_err(|error| error.to_string())?;
         }
     }
     let mut status = session_status(app).await?;
@@ -1752,10 +1683,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        auth_candidates_for_pdf, find_pdf_url, is_credential_cookie_name, is_platform_domain,
-        output_filename, DetailProbe, TextbookResource,
+        find_pdf_url, is_credential_cookie_name, is_platform_domain, output_filename,
+        TextbookResource,
     };
-    use std::collections::HashMap;
 
     fn resource() -> TextbookResource {
         TextbookResource {
@@ -1807,28 +1737,6 @@ mod tests {
             find_pdf_url("https:\\/\\/cdn.example.com\\/book.pdf", id).as_deref(),
             Some("https://cdn.example.com/book.pdf")
         );
-    }
-
-    #[test]
-    fn prioritizes_authorization_captured_for_the_pdf_request() {
-        let id = "abcdefgh-1234-5678-90ab-cdef01234567";
-        let pdf_url = format!("https://cdn.example.com/{id}/book.pdf");
-        let probe = DetailProbe {
-            html: String::new(),
-            auth: "unrelated-last-auth".into(),
-            urls: vec![pdf_url.clone()],
-            auth_by_url: HashMap::from([
-                (pdf_url.clone(), "pdf-auth".into()),
-                (
-                    format!("https://api.example.com/resources/{id}"),
-                    "resource-auth".into(),
-                ),
-            ]),
-        };
-        let candidates = auth_candidates_for_pdf(&probe, &pdf_url, id);
-        assert_eq!(candidates.first().map(String::as_str), Some("pdf-auth"));
-        assert!(candidates.contains(&"resource-auth".to_string()));
-        assert!(candidates.contains(&"unrelated-last-auth".to_string()));
     }
 
     #[test]

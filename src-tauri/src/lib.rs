@@ -2,7 +2,16 @@ use futures_util::StreamExt;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -140,6 +149,7 @@ struct SessionStatus {
 #[serde(rename_all = "camelCase")]
 struct QueueTask {
     id: String,
+    resource: TextbookResource,
     content_id: String,
     title: String,
     resource_year: String,
@@ -155,6 +165,12 @@ struct QueueTask {
     received_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -162,6 +178,8 @@ struct QueueTask {
 struct QueueState {
     batch_id: Option<String>,
     status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
     tasks: Vec<QueueTask>,
     history: Vec<Value>,
 }
@@ -194,9 +212,26 @@ struct DetailProbe {
 struct AppState {
     settings: Mutex<AppSettings>,
     queue: Mutex<QueueState>,
+    queue_runtime: Mutex<QueueRuntime>,
     settings_path: PathBuf,
     catalog_cache_path: PathBuf,
     library_path: PathBuf,
+    queue_path: PathBuf,
+}
+
+#[derive(Default)]
+struct QueueRuntime {
+    worker_active: bool,
+    active_signal: Option<Arc<AtomicU8>>,
+}
+
+const DOWNLOAD_RUNNING: u8 = 0;
+const DOWNLOAD_PAUSED: u8 = 1;
+const DOWNLOAD_CANCELED: u8 = 2;
+
+enum DownloadFailure {
+    Interrupted(u8),
+    Failed(String),
 }
 
 fn now_string() -> String {
@@ -379,9 +414,52 @@ fn idle_queue() -> QueueState {
     QueueState {
         batch_id: None,
         status: "idle".into(),
+        created_at: None,
         tasks: vec![],
         history: vec![],
     }
+}
+
+fn persist_queue(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let Ok(queue) = state.queue.lock().map(|queue| queue.clone()) else {
+        return;
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&queue) {
+        let _ = fs::write(&state.queue_path, json);
+    }
+}
+
+fn emit_queue(app: &tauri::AppHandle) -> QueueState {
+    let queue = app
+        .state::<AppState>()
+        .queue
+        .lock()
+        .map(|queue| queue.clone())
+        .unwrap_or_else(|_| idle_queue());
+    let _ = app.emit("download:queue", queue.clone());
+    queue
+}
+
+fn archive_current(queue: &mut QueueState) {
+    if queue.tasks.is_empty() {
+        return;
+    }
+    let archived = serde_json::json!({
+        "id": queue.batch_id.clone(),
+        "status": queue.status.clone(),
+        "createdAt": queue.created_at.clone(),
+        "updatedAt": iso_now(),
+        "tasks": queue.tasks.clone(),
+    });
+    queue.history.insert(0, archived);
+    queue.history.truncate(5);
+}
+
+fn part_path(resource: &TextbookResource, settings: &AppSettings) -> PathBuf {
+    let target = PathBuf::from(&settings.effective_download_directory)
+        .join(output_filename(resource, &settings.filename_template));
+    PathBuf::from(format!("{}.part", target.to_string_lossy()))
 }
 
 fn mark_downloaded(resources: &mut [TextbookResource], library_path: &PathBuf) {
@@ -522,19 +600,24 @@ async fn read_detail_probe(window: &WebviewWindow) -> Result<DetailProbe, String
 async fn resolve_pdf(
     app: &tauri::AppHandle,
     resource: &TextbookResource,
-) -> Result<(String, String, WebviewWindow), String> {
+    signal: &Arc<AtomicU8>,
+) -> Result<(String, String, WebviewWindow), DownloadFailure> {
     let label = format!("smartedu-detail-{}", now_string());
-    let detail = detail_url(resource)?;
+    let detail = detail_url(resource).map_err(DownloadFailure::Failed)?;
     let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(detail))
         .title("正在解析教材详情")
         .visible(false)
         .initialization_script(DETAIL_PROBE_SCRIPT)
         .on_navigation(is_platform_url)
         .build()
-        .map_err(|error| format!("创建教材详情窗口失败：{error}"))?;
+        .map_err(|error| DownloadFailure::Failed(format!("创建教材详情窗口失败：{error}")))?;
     let result = async {
         for _ in 0..24 {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            let directive = signal.load(Ordering::Relaxed);
+            if directive != DOWNLOAD_RUNNING {
+                return Err(DownloadFailure::Interrupted(directive));
+            }
             let probe = match read_detail_probe(&window).await {
                 Ok(value) => value,
                 Err(_) => continue,
@@ -546,7 +629,9 @@ async fn resolve_pdf(
                 return Ok((pdf_url, probe.auth));
             }
         }
-        Err("未能从教材详情解析到 PDF 地址，请确认登录状态和资源权限".to_string())
+        Err(DownloadFailure::Failed(
+            "未能从教材详情解析到 PDF 地址，请确认登录状态和资源权限".to_string(),
+        ))
     }
     .await;
     match result {
@@ -638,6 +723,7 @@ where
         };
         let mut task = queue.tasks.remove(index);
         update(&mut task, &mut queue);
+        task.updated_at = Some(iso_now());
         queue.tasks.insert(index, task);
         queue.clone()
     };
@@ -697,7 +783,8 @@ async fn download_single(
     app: tauri::AppHandle,
     resource: TextbookResource,
     task_id: String,
-) -> Result<(PathBuf, u64), String> {
+    signal: Arc<AtomicU8>,
+) -> Result<(PathBuf, u64), DownloadFailure> {
     report_progress(
         &app,
         &task_id,
@@ -706,19 +793,23 @@ async fn download_single(
         None,
         None,
     );
-    let (pdf_url, auth, detail_window) = resolve_pdf(&app, &resource).await?;
+    let (pdf_url, auth, detail_window) = resolve_pdf(&app, &resource, &signal).await?;
     let cookie = cookie_header_for_url(&detail_window, &pdf_url).unwrap_or_default();
     let _ = detail_window.close();
+    let directive = signal.load(Ordering::Relaxed);
+    if directive != DOWNLOAD_RUNNING {
+        return Err(DownloadFailure::Interrupted(directive));
+    }
     let settings = app
         .state::<AppState>()
         .settings
         .lock()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| DownloadFailure::Failed(error.to_string()))?
         .clone();
     let directory = PathBuf::from(&settings.effective_download_directory);
     tokio::fs::create_dir_all(&directory)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
     let target = directory.join(output_filename(&resource, &settings.filename_template));
     let part = PathBuf::from(format!("{}.part", target.to_string_lossy()));
     let part_size = tokio::fs::metadata(&part)
@@ -728,10 +819,13 @@ async fn download_single(
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| error.to_string())?;
-    let mut request = client
-        .get(&pdf_url)
-        .header(reqwest::header::REFERER, detail_url(&resource)?.to_string());
+        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
+    let mut request = client.get(&pdf_url).header(
+        reqwest::header::REFERER,
+        detail_url(&resource)
+            .map_err(DownloadFailure::Failed)?
+            .to_string(),
+    );
     if !auth.is_empty() {
         request = request.header("X-Nd-Auth", auth);
     }
@@ -744,9 +838,12 @@ async fn download_single(
     let response = request
         .send()
         .await
-        .map_err(|error| format!("下载请求失败：{error}"))?;
+        .map_err(|error| DownloadFailure::Failed(format!("下载请求失败：{error}")))?;
     if !response.status().is_success() {
-        return Err(format!("下载请求失败：HTTP {}", response.status()));
+        return Err(DownloadFailure::Failed(format!(
+            "下载请求失败：HTTP {}",
+            response.status()
+        )));
     }
     let resumed = part_size > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     if part_size > 0 && !resumed {
@@ -778,16 +875,28 @@ async fn download_single(
         .truncate(!resumed)
         .open(&part)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
     let mut stream = response.bytes_stream();
     let mut received = base;
     let mut last_reported = base;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("下载中断：{error}"))?;
+        let directive = signal.load(Ordering::Relaxed);
+        if directive != DOWNLOAD_RUNNING {
+            output
+                .flush()
+                .await
+                .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
+            drop(output);
+            if directive == DOWNLOAD_CANCELED {
+                let _ = tokio::fs::remove_file(&part).await;
+            }
+            return Err(DownloadFailure::Interrupted(directive));
+        }
+        let chunk = chunk.map_err(|error| DownloadFailure::Failed(format!("下载中断：{error}")))?;
         output
             .write_all(&chunk)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
         received += chunk.len() as u64;
         if received.saturating_sub(last_reported) >= 256 * 1024 {
             last_reported = received;
@@ -805,8 +914,18 @@ async fn download_single(
             );
         }
     }
-    output.flush().await.map_err(|error| error.to_string())?;
+    output
+        .flush()
+        .await
+        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
     drop(output);
+    let directive = signal.load(Ordering::Relaxed);
+    if directive != DOWNLOAD_RUNNING {
+        if directive == DOWNLOAD_CANCELED {
+            let _ = tokio::fs::remove_file(&part).await;
+        }
+        return Err(DownloadFailure::Interrupted(directive));
+    }
     report_progress(
         &app,
         &task_id,
@@ -817,31 +936,31 @@ async fn download_single(
     );
     let mut file = tokio::fs::File::open(&part)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
     let mut header = [0_u8; 5];
     file.read_exact(&mut header)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
     let size = file
         .metadata()
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| DownloadFailure::Failed(error.to_string()))?
         .len();
     if &header != b"%PDF-" {
         let _ = tokio::fs::remove_file(&part).await;
-        return Err("下载内容不是 PDF 文件".into());
+        return Err(DownloadFailure::Failed("下载内容不是 PDF 文件".into()));
     }
     if resource.size_bytes > 0 && size != resource.size_bytes {
         let _ = tokio::fs::remove_file(&part).await;
-        return Err(format!(
+        return Err(DownloadFailure::Failed(format!(
             "文件大小校验失败：期望 {}，实际 {}",
             resource.size_bytes, size
-        ));
+        )));
     }
     let _ = tokio::fs::remove_file(&target).await;
     tokio::fs::rename(&part, &target)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
     save_library_item(
         &app,
         LibraryItem {
@@ -863,7 +982,8 @@ async fn download_single(
             exists: true,
         },
     )
-    .await?;
+    .await
+    .map_err(DownloadFailure::Failed)?;
     Ok((target, size))
 }
 
@@ -1032,104 +1152,418 @@ fn download_state(state: tauri::State<'_, AppState>) -> Result<QueueState, Strin
         .map(|queue| queue.clone())
         .map_err(|error| error.to_string())
 }
+
+fn ensure_queue_worker(app: tauri::AppHandle) {
+    let should_start = {
+        let state = app.state::<AppState>();
+        let Ok(mut runtime) = state.queue_runtime.lock() else {
+            return;
+        };
+        if runtime.worker_active {
+            false
+        } else {
+            runtime.worker_active = true;
+            true
+        }
+    };
+    if !should_start {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        run_queue_worker(app.clone()).await;
+        {
+            let state = app.state::<AppState>();
+            if let Ok(mut runtime) = state.queue_runtime.lock() {
+                runtime.worker_active = false;
+                runtime.active_signal = None;
+            };
+        }
+        let restart = app
+            .state::<AppState>()
+            .queue
+            .lock()
+            .map(|queue| {
+                queue.status == "running" && queue.tasks.iter().any(|task| task.status == "queued")
+            })
+            .unwrap_or(false);
+        if restart {
+            ensure_queue_worker(app);
+        }
+    });
+}
+
+async fn run_queue_worker(app: tauri::AppHandle) {
+    loop {
+        let (next, completed_batch) = {
+            let state = app.state::<AppState>();
+            let Ok(mut queue) = state.queue.lock() else {
+                return;
+            };
+            if queue.status != "running" {
+                (None, false)
+            } else if let Some(index) = queue.tasks.iter().position(|task| task.status == "queued")
+            {
+                let task = &mut queue.tasks[index];
+                task.status = "running".into();
+                task.phase = Some("resolving".into());
+                task.message = Some("正在准备教材详情".into());
+                task.error = None;
+                task.started_at = Some(iso_now());
+                task.completed_at = None;
+                task.updated_at = Some(iso_now());
+                (Some((task.id.clone(), task.resource.clone())), false)
+            } else {
+                queue.status = "complete".into();
+                (None, true)
+            }
+        };
+        if completed_batch {
+            persist_queue(&app);
+            emit_queue(&app);
+            return;
+        }
+        let Some((task_id, resource)) = next else {
+            return;
+        };
+        persist_queue(&app);
+        emit_queue(&app);
+
+        let signal = Arc::new(AtomicU8::new(DOWNLOAD_RUNNING));
+        if let Ok(mut runtime) = app.state::<AppState>().queue_runtime.lock() {
+            runtime.active_signal = Some(signal.clone());
+        }
+        let result = download_single(app.clone(), resource, task_id.clone(), signal).await;
+        if let Ok(mut runtime) = app.state::<AppState>().queue_runtime.lock() {
+            runtime.active_signal = None;
+        }
+        {
+            let state = app.state::<AppState>();
+            let Ok(mut queue) = state.queue.lock() else {
+                return;
+            };
+            let queue_status = queue.status.clone();
+            let Some(task) = queue.tasks.iter_mut().find(|task| task.id == task_id) else {
+                continue;
+            };
+            match result {
+                Ok((_path, size)) if queue_status != "canceled" => {
+                    task.status = "complete".into();
+                    task.phase = Some("complete".into());
+                    task.message = Some("下载完成".into());
+                    task.received_bytes = Some(size);
+                    task.total_bytes = Some(size);
+                    task.error = None;
+                    task.completed_at = Some(iso_now());
+                }
+                Ok(_) | Err(DownloadFailure::Interrupted(DOWNLOAD_CANCELED)) => {
+                    task.status = "canceled".into();
+                    task.phase = Some("canceled".into());
+                    task.message = Some("已取消".into());
+                    task.error = None;
+                    task.completed_at = Some(iso_now());
+                }
+                Err(DownloadFailure::Interrupted(_)) => {
+                    if queue_status == "running" {
+                        task.status = "queued".into();
+                        task.phase = Some("queued".into());
+                        task.message = Some("等待继续下载".into());
+                    } else {
+                        task.status = "paused".into();
+                        task.phase = Some("paused".into());
+                        task.message = Some("已暂停，可继续下载".into());
+                    }
+                }
+                Err(DownloadFailure::Failed(error)) => {
+                    if queue_status == "paused" {
+                        task.status = "paused".into();
+                        task.phase = Some("paused".into());
+                        task.message = Some("已暂停，可继续下载".into());
+                    } else if queue_status == "canceled" {
+                        task.status = "canceled".into();
+                        task.phase = Some("canceled".into());
+                        task.message = Some("已取消".into());
+                    } else {
+                        task.status = "error".into();
+                        task.phase = Some("error".into());
+                        task.message = Some(error.clone());
+                        task.error = Some(error);
+                        task.completed_at = Some(iso_now());
+                    }
+                }
+            }
+            task.updated_at = Some(iso_now());
+        }
+        persist_queue(&app);
+        emit_queue(&app);
+    }
+}
+
 #[tauri::command]
 async fn start_download(
     resources: Vec<TextbookResource>,
     app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
 ) -> Result<QueueState, String> {
-    if resources.len() != 1 {
-        return Err("轻量版当前测试阶段每次仅支持下载一本教材".into());
+    if resources.is_empty() {
+        return Err("请至少选择一本教材".into());
     }
     if !session_status(app.clone()).await?.has_saved_session {
         return Err("尚未检测到平台登录档案，请先登录".into());
     }
-    let resource = resources.into_iter().next().expect("one resource");
-    let id = format!("lite-task-{}", now_string());
-    let queue = QueueState {
-        batch_id: Some(format!("lite-batch-{}", now_string())),
+    let created_at = iso_now();
+    let state = app.state::<AppState>();
+    let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+    if queue.status == "running" || queue.status == "paused" {
+        return Err("已有正在进行的下载任务，请先暂停、取消或等待其完成".into());
+    }
+    archive_current(&mut queue);
+    let history = std::mem::take(&mut queue.history);
+    let batch_stamp = now_string();
+    *queue = QueueState {
+        batch_id: Some(format!("lite-batch-{batch_stamp}")),
         status: "running".into(),
-        tasks: vec![QueueTask {
-            id: id.clone(),
-            content_id: resource.content_id.clone(),
-            title: resource.title.clone(),
-            resource_year: resource.resource_year.clone(),
-            size_bytes: resource.size_bytes,
-            status: "running".into(),
-            error: None,
-            phase: Some("resolving".into()),
-            message: Some("正在准备教材详情".into()),
-            received_bytes: None,
-            total_bytes: None,
-        }],
-        history: vec![],
+        created_at: Some(created_at.clone()),
+        tasks: resources
+            .into_iter()
+            .enumerate()
+            .map(|(index, resource)| QueueTask {
+                id: format!("lite-task-{batch_stamp}-{index}"),
+                content_id: resource.content_id.clone(),
+                title: resource.title.clone(),
+                resource_year: resource.resource_year.clone(),
+                size_bytes: resource.size_bytes,
+                resource,
+                status: "queued".into(),
+                error: None,
+                phase: Some("queued".into()),
+                message: Some("等待下载".into()),
+                received_bytes: None,
+                total_bytes: None,
+                updated_at: Some(created_at.clone()),
+                started_at: None,
+                completed_at: None,
+            })
+            .collect(),
+        history,
     };
-    *state.queue.lock().map_err(|error| error.to_string())? = queue.clone();
-    let _ = app.emit("download:queue", queue.clone());
-    let worker_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        match download_single(worker_app.clone(), resource, id.clone()).await {
-            Ok((_path, size)) => update_task(&worker_app, &id, |task, queue| {
-                task.status = "complete".into();
-                task.phase = Some("complete".into());
-                task.message = Some("下载完成".into());
-                task.received_bytes = Some(size);
-                task.total_bytes = Some(size);
-                task.error = None;
-                queue.status = "complete".into();
-            }),
-            Err(error) => update_task(&worker_app, &id, |task, queue| {
-                task.status = "error".into();
-                task.phase = Some("error".into());
-                task.message = Some(error.clone());
-                task.error = Some(error);
-                queue.status = "complete".into();
-            }),
+    let snapshot = queue.clone();
+    drop(queue);
+    persist_queue(&app);
+    let _ = app.emit("download:queue", snapshot.clone());
+    ensure_queue_worker(app);
+    Ok(snapshot)
+}
+#[tauri::command]
+fn pause_download(app: tauri::AppHandle) -> Result<QueueState, String> {
+    let state = app.state::<AppState>();
+    let snapshot = {
+        let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+        if queue.status != "running" {
+            return Ok(queue.clone());
         }
-    });
-    Ok(queue)
+        queue.status = "paused".into();
+        for task in &mut queue.tasks {
+            if task.status == "queued" || task.status == "running" {
+                task.status = "paused".into();
+                task.phase = Some("paused".into());
+                task.message = Some("已暂停".into());
+                task.updated_at = Some(iso_now());
+            }
+        }
+        queue.clone()
+    };
+    if let Ok(runtime) = state.queue_runtime.lock() {
+        if let Some(signal) = &runtime.active_signal {
+            signal.store(DOWNLOAD_PAUSED, Ordering::Relaxed);
+        }
+    }
+    persist_queue(&app);
+    let _ = app.emit("download:queue", snapshot.clone());
+    Ok(snapshot)
 }
 #[tauri::command]
-fn pause_download(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
-    state
-        .queue
-        .lock()
-        .map(|queue| queue.clone())
-        .map_err(|error| error.to_string())
+fn resume_download(app: tauri::AppHandle) -> Result<QueueState, String> {
+    let snapshot = {
+        let state = app.state::<AppState>();
+        let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+        if queue.status != "paused" {
+            return Ok(queue.clone());
+        }
+        queue.status = "running".into();
+        for task in &mut queue.tasks {
+            if task.status == "paused" {
+                task.status = "queued".into();
+                task.phase = Some("queued".into());
+                task.message = Some("等待继续下载".into());
+                task.updated_at = Some(iso_now());
+            }
+        }
+        queue.clone()
+    };
+    persist_queue(&app);
+    let _ = app.emit("download:queue", snapshot.clone());
+    ensure_queue_worker(app);
+    Ok(snapshot)
 }
 #[tauri::command]
-fn resume_download(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
-    pause_download(state)
+async fn cancel_download(app: tauri::AppHandle) -> Result<QueueState, String> {
+    let state = app.state::<AppState>();
+    let (snapshot, resources, settings) = {
+        let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+        if queue.status != "running" && queue.status != "paused" {
+            return Ok(queue.clone());
+        }
+        queue.status = "canceled".into();
+        let resources = queue
+            .tasks
+            .iter_mut()
+            .filter_map(|task| {
+                if task.status == "queued" || task.status == "paused" || task.status == "running" {
+                    task.status = "canceled".into();
+                    task.phase = Some("canceled".into());
+                    task.message = Some("已取消".into());
+                    task.completed_at = Some(iso_now());
+                    task.updated_at = Some(iso_now());
+                    Some(task.resource.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone();
+        (queue.clone(), resources, settings)
+    };
+    if let Ok(runtime) = state.queue_runtime.lock() {
+        if let Some(signal) = &runtime.active_signal {
+            signal.store(DOWNLOAD_CANCELED, Ordering::Relaxed);
+        }
+    }
+    for resource in resources {
+        let _ = tokio::fs::remove_file(part_path(&resource, &settings)).await;
+    }
+    persist_queue(&app);
+    let _ = app.emit("download:queue", snapshot.clone());
+    Ok(snapshot)
 }
 #[tauri::command]
-fn cancel_download(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
-    pause_download(state)
+fn retry_task(task_id: String, app: tauri::AppHandle) -> Result<QueueState, String> {
+    let snapshot = {
+        let state = app.state::<AppState>();
+        let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+        if queue.status == "running" || queue.status == "paused" {
+            return Err("当前批次正在运行，无法重试".into());
+        }
+        let Some(task) = queue.tasks.iter_mut().find(|task| task.id == task_id) else {
+            return Ok(queue.clone());
+        };
+        if task.status != "error" && task.status != "canceled" {
+            return Ok(queue.clone());
+        }
+        task.status = "queued".into();
+        task.phase = Some("queued".into());
+        task.message = Some("等待重试".into());
+        task.error = None;
+        task.completed_at = None;
+        task.updated_at = Some(iso_now());
+        queue.status = "running".into();
+        queue.clone()
+    };
+    persist_queue(&app);
+    let _ = app.emit("download:queue", snapshot.clone());
+    ensure_queue_worker(app);
+    Ok(snapshot)
 }
 #[tauri::command]
-fn retry_task(_task_id: String, state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
-    pause_download(state)
+fn retry_all_tasks(app: tauri::AppHandle) -> Result<QueueState, String> {
+    let snapshot = {
+        let state = app.state::<AppState>();
+        let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+        if queue.status == "running" || queue.status == "paused" {
+            return Err("当前批次正在运行，无法重试".into());
+        }
+        let mut changed = false;
+        for task in &mut queue.tasks {
+            if task.status == "error" || task.status == "canceled" || task.status == "paused" {
+                task.status = "queued".into();
+                task.phase = Some("queued".into());
+                task.message = Some("等待重试".into());
+                task.error = None;
+                task.completed_at = None;
+                task.updated_at = Some(iso_now());
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(queue.clone());
+        }
+        queue.status = "running".into();
+        queue.clone()
+    };
+    persist_queue(&app);
+    let _ = app.emit("download:queue", snapshot.clone());
+    ensure_queue_worker(app);
+    Ok(snapshot)
 }
 #[tauri::command]
-fn retry_all_tasks(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
-    pause_download(state)
-}
-#[tauri::command]
-fn clear_finished_tasks(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+fn clear_finished_tasks(app: tauri::AppHandle) -> Result<QueueState, String> {
+    let state = app.state::<AppState>();
     let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
     if queue.status == "complete" || queue.status == "canceled" {
-        *queue = idle_queue();
+        queue.tasks.retain(|task| {
+            task.status != "complete" && task.status != "error" && task.status != "canceled"
+        });
+        if queue.tasks.is_empty() {
+            let history = std::mem::take(&mut queue.history);
+            *queue = idle_queue();
+            queue.history = history;
+        }
     }
-    Ok(queue.clone())
+    let snapshot = queue.clone();
+    drop(queue);
+    persist_queue(&app);
+    let _ = app.emit("download:queue", snapshot.clone());
+    Ok(snapshot)
 }
 #[tauri::command]
-fn clear_download_history(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
-    pause_download(state)
-}
-#[tauri::command]
-fn clear_all_task_records(state: tauri::State<'_, AppState>) -> Result<QueueState, String> {
+fn clear_download_history(app: tauri::AppHandle) -> Result<QueueState, String> {
+    let state = app.state::<AppState>();
     let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
-    *queue = idle_queue();
-    Ok(queue.clone())
+    queue.history.clear();
+    let snapshot = queue.clone();
+    drop(queue);
+    persist_queue(&app);
+    let _ = app.emit("download:queue", snapshot.clone());
+    Ok(snapshot)
+}
+#[tauri::command]
+async fn clear_all_task_records(app: tauri::AppHandle) -> Result<QueueState, String> {
+    let state = app.state::<AppState>();
+    let (resources, settings) = {
+        let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+        if queue.status == "running" || queue.status == "paused" {
+            return Err("下载任务进行中，无法清除任务记录".into());
+        }
+        let resources = queue
+            .tasks
+            .iter()
+            .map(|task| task.resource.clone())
+            .collect::<Vec<_>>();
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone();
+        *queue = idle_queue();
+        (resources, settings)
+    };
+    for resource in resources {
+        let _ = tokio::fs::remove_file(part_path(&resource, &settings)).await;
+    }
+    persist_queue(&app);
+    Ok(emit_queue(&app))
 }
 #[tauri::command]
 fn list_library(state: tauri::State<'_, AppState>) -> Vec<LibraryItem> {
@@ -1181,18 +1615,35 @@ pub fn run() {
                 .download_dir()?
                 .join("SmartEdu Textbook Library Lite");
             let settings_path = data_dir.join("settings.json");
+            let queue_path = data_dir.join("queue.json");
             let settings = fs::read_to_string(&settings_path)
                 .ok()
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_else(|| {
                     default_settings(default_download.to_string_lossy().into_owned())
                 });
+            let mut queue = fs::read_to_string(&queue_path)
+                .ok()
+                .and_then(|json| serde_json::from_str::<QueueState>(&json).ok())
+                .unwrap_or_else(idle_queue);
+            if queue.status == "running" {
+                queue.status = "paused".into();
+                for task in &mut queue.tasks {
+                    if task.status == "running" || task.status == "queued" {
+                        task.status = "paused".into();
+                        task.phase = Some("paused".into());
+                        task.message = Some("上次运行被中断，可继续下载".into());
+                    }
+                }
+            }
             app.manage(AppState {
                 settings: Mutex::new(settings),
-                queue: Mutex::new(idle_queue()),
+                queue: Mutex::new(queue),
+                queue_runtime: Mutex::new(QueueRuntime::default()),
                 settings_path,
                 catalog_cache_path: data_dir.join("catalog-cache.json"),
                 library_path: data_dir.join("library.json"),
+                queue_path,
             });
             Ok(())
         })

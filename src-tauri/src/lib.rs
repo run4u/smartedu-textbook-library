@@ -643,10 +643,9 @@ async fn resolve_pdf(
     }
 }
 
-fn cookie_header_for_url(window: &WebviewWindow, url: &str) -> Result<String, String> {
-    let url = tauri::Url::parse(url).map_err(|error| error.to_string())?;
+fn cookie_header_for_window(window: &WebviewWindow) -> Result<String, String> {
     window
-        .cookies_for_url(url)
+        .cookies()
         .map_err(|error| error.to_string())
         .map(|cookies| {
             cookies
@@ -794,7 +793,10 @@ async fn download_single(
         None,
     );
     let (pdf_url, auth, detail_window) = resolve_pdf(&app, &resource, &signal).await?;
-    let cookie = cookie_header_for_url(&detail_window, &pdf_url).unwrap_or_default();
+    // The authentication cookies are commonly scoped to smartedu.cn while the
+    // resolved PDF is served from a different CDN host. Reading all cookies
+    // from the authenticated WebView preserves that cross-host session.
+    let cookie = cookie_header_for_window(&detail_window).unwrap_or_default();
     let _ = detail_window.close();
     let directive = signal.load(Ordering::Relaxed);
     if directive != DOWNLOAD_RUNNING {
@@ -820,12 +822,19 @@ async fn download_single(
         .connect_timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
-    let mut request = client.get(&pdf_url).header(
-        reqwest::header::REFERER,
-        detail_url(&resource)
-            .map_err(DownloadFailure::Failed)?
-            .to_string(),
-    );
+    let mut request = client
+        .get(&pdf_url)
+        .header(
+            reqwest::header::REFERER,
+            detail_url(&resource)
+                .map_err(DownloadFailure::Failed)?
+                .to_string(),
+        )
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        )
+        .header(reqwest::header::ACCEPT, "application/pdf,*/*");
     if !auth.is_empty() {
         request = request.header("X-Nd-Auth", auth);
     }

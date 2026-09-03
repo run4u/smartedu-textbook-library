@@ -745,6 +745,7 @@ async fn start_browser_download(
                 let response_webview: ICoreWebView2_2 =
                     webview.cast().map_err(|error| error.to_string())?;
                 let expected_url = pdf_url.clone();
+                let mut response_token = 0_i64;
                 response_webview
                     .add_WebResourceResponseReceived(
                         &WebResourceResponseReceivedEventHandler::create(Box::new(
@@ -832,6 +833,7 @@ async fn start_browser_download(
                                 Ok(())
                             },
                         )),
+                        &mut response_token,
                     )
                     .map_err(|error| error.to_string())?;
                 let mut headers = format!("Referer: {referer}\r\nAccept: application/pdf,*/*\r\n");

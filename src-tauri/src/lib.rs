@@ -6,7 +6,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -73,15 +73,6 @@ const READ_DETAIL_PROBE_SCRIPT: &str = r#"
 })()
 "#;
 
-const READ_BROWSER_DOWNLOAD_SCRIPT: &str = r#"
-(() => window.__smarteduLiteDownload || {
-  status: 'waiting',
-  loaded: 0,
-  total: 0,
-  error: ''
-})()
-"#;
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TextbookResource {
@@ -97,15 +88,6 @@ struct TextbookResource {
     update_time: String,
     size_bytes: u64,
     local_state: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserDownloadProbe {
-    status: String,
-    loaded: u64,
-    total: u64,
-    error: String,
 }
 
 struct BrowserDownloadFinished {
@@ -632,6 +614,7 @@ async fn resolve_pdf(
         String,
         WebviewWindow,
         tokio::sync::oneshot::Receiver<BrowserDownloadFinished>,
+        Arc<AtomicBool>,
     ),
     DownloadFailure,
 > {
@@ -639,6 +622,8 @@ async fn resolve_pdf(
     let detail = detail_url(resource).map_err(DownloadFailure::Failed)?;
     let (download_sender, download_receiver) = tokio::sync::oneshot::channel();
     let download_sender = Arc::new(Mutex::new(Some(download_sender)));
+    let download_started = Arc::new(AtomicBool::new(false));
+    let callback_started = download_started.clone();
     let callback_target = download_target.clone();
     let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(detail))
         .title("正在解析教材详情")
@@ -649,6 +634,7 @@ async fn resolve_pdf(
             match event {
                 DownloadEvent::Requested { destination, .. } => {
                     *destination = callback_target.clone();
+                    callback_started.store(true, Ordering::Relaxed);
                 }
                 DownloadEvent::Finished { path, success, .. } => {
                     if let Ok(mut sender) = download_sender.lock() {
@@ -692,7 +678,7 @@ async fn resolve_pdf(
     }
     .await;
     match result {
-        Ok((pdf_url, auth)) => Ok((pdf_url, auth, window, download_receiver)),
+        Ok((pdf_url, auth)) => Ok((pdf_url, auth, window, download_receiver, download_started)),
         Err(error) => {
             let _ = window.close();
             Err(error)
@@ -700,13 +686,52 @@ async fn resolve_pdf(
     }
 }
 
-async fn read_browser_download_probe(
+#[cfg(windows)]
+async fn start_browser_download(
     window: &WebviewWindow,
-) -> Result<BrowserDownloadProbe, String> {
+    pdf_url: &str,
+    auth: &str,
+    referer: &str,
+) -> Result<(), String> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Environment9, ICoreWebView2_10,
+    };
+    use windows_core::{Interface, HSTRING};
+
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let sender = Mutex::new(Some(sender));
+    let pdf_url = pdf_url.to_string();
+    let auth = auth.to_string();
+    let referer = referer.to_string();
     window
-        .eval_with_callback(READ_BROWSER_DOWNLOAD_SCRIPT, move |result| {
+        .with_webview(move |platform| {
+            let result = (|| unsafe {
+                let environment: ICoreWebView2Environment9 = platform
+                    .environment()
+                    .cast()
+                    .map_err(|error| error.to_string())?;
+                let webview: ICoreWebView2_10 = platform
+                    .controller()
+                    .CoreWebView2()
+                    .map_err(|error| error.to_string())?
+                    .cast()
+                    .map_err(|error| error.to_string())?;
+                let mut headers = format!("Referer: {referer}\r\nAccept: application/pdf,*/*\r\n");
+                if !auth.is_empty() {
+                    headers.push_str(&format!("X-Nd-Auth: {auth}\r\n"));
+                }
+                let request = environment
+                    .CreateWebResourceRequest(
+                        &HSTRING::from(pdf_url),
+                        &HSTRING::from("GET"),
+                        None,
+                        &HSTRING::from(headers),
+                    )
+                    .map_err(|error| error.to_string())?;
+                webview
+                    .NavigateWithWebResourceRequest(&request)
+                    .map_err(|error| error.to_string())
+            })();
             if let Ok(mut sender) = sender.lock() {
                 if let Some(sender) = sender.take() {
                     let _ = sender.send(result);
@@ -714,14 +739,19 @@ async fn read_browser_download_probe(
             }
         })
         .map_err(|error| error.to_string())?;
-    let result = tokio::time::timeout(Duration::from_secs(5), receiver)
+    tokio::time::timeout(Duration::from_secs(5), receiver)
         .await
-        .map_err(|_| "读取浏览器下载状态超时".to_string())?
-        .map_err(|_| "教材详情窗口提前关闭".to_string())?;
-    serde_json::from_str(&result).map_err(|error| format!("浏览器下载状态格式异常：{error}"))
+        .map_err(|_| "启动 WebView2 下载请求超时".to_string())?
+        .map_err(|_| "教材详情窗口提前关闭".to_string())?
 }
 
-fn start_browser_download(window: &WebviewWindow, pdf_url: &str, auth: &str) -> Result<(), String> {
+#[cfg(not(windows))]
+async fn start_browser_download(
+    window: &WebviewWindow,
+    pdf_url: &str,
+    auth: &str,
+    _referer: &str,
+) -> Result<(), String> {
     let pdf_url = serde_json::to_string(pdf_url).map_err(|error| error.to_string())?;
     let auth = serde_json::to_string(auth).map_err(|error| error.to_string())?;
     let script = format!(
@@ -924,9 +954,14 @@ async fn download_single(
     let target = directory.join(output_filename(&resource, &settings.filename_template));
     let part = PathBuf::from(format!("{}.part", target.to_string_lossy()));
     let _ = tokio::fs::remove_file(&part).await;
-    let (pdf_url, auth, detail_window, mut download_receiver) =
+    let (pdf_url, auth, detail_window, mut download_receiver, download_started) =
         resolve_pdf(&app, &resource, &signal, part.clone()).await?;
-    start_browser_download(&detail_window, &pdf_url, &auth).map_err(DownloadFailure::Failed)?;
+    let referer = detail_url(&resource)
+        .map_err(DownloadFailure::Failed)?
+        .to_string();
+    start_browser_download(&detail_window, &pdf_url, &auth, &referer)
+        .await
+        .map_err(DownloadFailure::Failed)?;
     report_progress(
         &app,
         &task_id,
@@ -935,6 +970,7 @@ async fn download_single(
         Some(0),
         (resource.size_bytes > 0).then_some(resource.size_bytes),
     );
+    let waiting_since = std::time::Instant::now();
     let finished = loop {
         let directive = signal.load(Ordering::Relaxed);
         if directive != DOWNLOAD_RUNNING {
@@ -952,27 +988,29 @@ async fn download_single(
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
-        if let Ok(probe) = read_browser_download_probe(&detail_window).await {
-            if probe.status == "error" {
-                let _ = detail_window.close();
-                let _ = tokio::fs::remove_file(&part).await;
-                return Err(DownloadFailure::Failed(probe.error));
-            }
-            report_progress(
-                &app,
-                &task_id,
-                "downloading",
-                if probe.status == "saving" {
-                    "正在保存教材文件"
-                } else {
-                    "正在通过登录页面下载"
-                },
-                Some(probe.loaded),
-                (probe.total > 0)
-                    .then_some(probe.total)
-                    .or((resource.size_bytes > 0).then_some(resource.size_bytes)),
-            );
+        let started = download_started.load(Ordering::Relaxed);
+        if !started && waiting_since.elapsed() > Duration::from_secs(30) {
+            let _ = detail_window.close();
+            return Err(DownloadFailure::Failed(
+                "WebView2 未触发 PDF 下载，请重新登录后重试".into(),
+            ));
         }
+        let received = tokio::fs::metadata(&part)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        report_progress(
+            &app,
+            &task_id,
+            "downloading",
+            if started {
+                "正在通过登录页面下载"
+            } else {
+                "正在启动浏览器下载"
+            },
+            Some(received),
+            (resource.size_bytes > 0).then_some(resource.size_bytes),
+        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
     let _ = detail_window.close();

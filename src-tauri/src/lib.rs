@@ -515,6 +515,10 @@ fn is_platform_url(url: &tauri::Url) -> bool {
     })
 }
 
+fn is_secure_url(url: &tauri::Url) -> bool {
+    url.scheme() == "https"
+}
+
 fn session_cookie_values(window: &WebviewWindow) -> Result<HashMap<String, String>, String> {
     window
         .cookies()
@@ -620,6 +624,7 @@ async fn resolve_pdf(
         tokio::sync::oneshot::Receiver<BrowserDownloadFinished>,
         Arc<AtomicBool>,
         BrowserDownloadSender,
+        Arc<Mutex<String>>,
     ),
     DownloadFailure,
 > {
@@ -629,13 +634,17 @@ async fn resolve_pdf(
     let download_sender: BrowserDownloadSender = Arc::new(Mutex::new(Some(download_sender)));
     let callback_sender = download_sender.clone();
     let download_started = Arc::new(AtomicBool::new(false));
+    let response_observation = Arc::new(Mutex::new(String::new()));
     let callback_started = download_started.clone();
     let callback_target = download_target.clone();
     let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(detail))
         .title("正在解析教材详情")
         .visible(false)
         .initialization_script(DETAIL_PROBE_SCRIPT)
-        .on_navigation(is_platform_url)
+        // The platform can redirect textbook PDFs to CDN hosts outside the
+        // login-domain allowlist. This hidden window only follows HTTPS URLs
+        // discovered from the authenticated textbook detail page.
+        .on_navigation(is_secure_url)
         .on_download(move |_webview, event| {
             match event {
                 DownloadEvent::Requested { destination, .. } => {
@@ -695,6 +704,7 @@ async fn resolve_pdf(
             download_receiver,
             download_started,
             download_sender,
+            response_observation,
         )),
         Err(error) => {
             let _ = window.close();
@@ -712,6 +722,7 @@ async fn start_browser_download(
     target: PathBuf,
     finished_sender: BrowserDownloadSender,
     response_started: Arc<AtomicBool>,
+    response_observation: Arc<Mutex<String>>,
 ) -> Result<(), String> {
     use std::io::Write;
     use webview2_com::{
@@ -757,13 +768,53 @@ async fn start_browser_download(
                                 let mut raw_uri = PWSTR::null();
                                 request.Uri(&mut raw_uri)?;
                                 let uri = take_pwstr(raw_uri);
-                                if uri != expected_url {
-                                    return Ok(());
-                                }
-                                response_started.store(true, Ordering::Relaxed);
                                 let response = args.Response()?;
                                 let mut status = 0;
                                 response.StatusCode(&mut status)?;
+                                let headers = response.Headers()?;
+                                let mut raw_content_type = PWSTR::null();
+                                let content_type = if headers
+                                    .GetHeader(
+                                        &HSTRING::from("Content-Type"),
+                                        &mut raw_content_type,
+                                    )
+                                    .is_ok()
+                                {
+                                    take_pwstr(raw_content_type)
+                                } else {
+                                    String::new()
+                                };
+                                let expected_path = reqwest::Url::parse(&expected_url)
+                                    .ok()
+                                    .map(|url| url.path().to_ascii_lowercase());
+                                let actual_path = reqwest::Url::parse(&uri)
+                                    .ok()
+                                    .map(|url| url.path().to_ascii_lowercase());
+                                let same_path =
+                                    expected_path.is_some() && expected_path == actual_path;
+                                let pdf_type = content_type
+                                    .to_ascii_lowercase()
+                                    .contains("application/pdf");
+                                let pdf_path = actual_path
+                                    .as_deref()
+                                    .is_some_and(|path| path.ends_with(".pdf"));
+                                if uri != expected_url && !same_path && !pdf_type && !pdf_path {
+                                    return Ok(());
+                                }
+                                if let Ok(mut observation) = response_observation.lock() {
+                                    *observation = format!(
+                                        "URL: {uri}；HTTP {status}；Content-Type: {}",
+                                        if content_type.is_empty() {
+                                            "未提供"
+                                        } else {
+                                            &content_type
+                                        }
+                                    );
+                                }
+                                if (300..400).contains(&status) {
+                                    return Ok(());
+                                }
+                                response_started.store(true, Ordering::Relaxed);
                                 if !(200..300).contains(&status) {
                                     if let Ok(mut sender) = finished_sender.lock() {
                                         if let Some(sender) = sender.take() {
@@ -874,6 +925,7 @@ async fn start_browser_download(
     _target: PathBuf,
     _finished_sender: BrowserDownloadSender,
     _response_started: Arc<AtomicBool>,
+    _response_observation: Arc<Mutex<String>>,
 ) -> Result<(), String> {
     let pdf_url = serde_json::to_string(pdf_url).map_err(|error| error.to_string())?;
     let auth = serde_json::to_string(auth).map_err(|error| error.to_string())?;
@@ -1077,8 +1129,15 @@ async fn download_single(
     let target = directory.join(output_filename(&resource, &settings.filename_template));
     let part = PathBuf::from(format!("{}.part", target.to_string_lossy()));
     let _ = tokio::fs::remove_file(&part).await;
-    let (pdf_url, auth, detail_window, mut download_receiver, download_started, download_sender) =
-        resolve_pdf(&app, &resource, &signal, part.clone()).await?;
+    let (
+        pdf_url,
+        auth,
+        detail_window,
+        mut download_receiver,
+        download_started,
+        download_sender,
+        response_observation,
+    ) = resolve_pdf(&app, &resource, &signal, part.clone()).await?;
     let referer = detail_url(&resource)
         .map_err(DownloadFailure::Failed)?
         .to_string();
@@ -1090,6 +1149,7 @@ async fn download_single(
         part.clone(),
         download_sender,
         download_started.clone(),
+        response_observation.clone(),
     )
     .await
     .map_err(DownloadFailure::Failed)?;
@@ -1122,9 +1182,15 @@ async fn download_single(
         let started = download_started.load(Ordering::Relaxed);
         if !started && waiting_since.elapsed() > Duration::from_secs(30) {
             let _ = detail_window.close();
-            return Err(DownloadFailure::Failed(
-                "WebView2 未触发 PDF 下载，请重新登录后重试".into(),
-            ));
+            let observation = response_observation
+                .lock()
+                .map(|value| value.clone())
+                .unwrap_or_default();
+            return Err(DownloadFailure::Failed(if observation.is_empty() {
+                "WebView2 未捕获到 PDF 响应；详情页可能返回了不同的资源地址".into()
+            } else {
+                format!("WebView2 未能读取 PDF 响应（最后候选：{observation}）")
+            }));
         }
         let received = tokio::fs::metadata(&part)
             .await

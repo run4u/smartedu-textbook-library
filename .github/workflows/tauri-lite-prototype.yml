@@ -44,6 +44,8 @@ jobs:
           path: cargo-check.log
           if-no-files-found: ignore
           retention-days: 14
+      - name: Test Rust backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
       - run: npm run lite:build
       - name: Upload Windows lite prototype
         uses: actions/upload-artifact@v4

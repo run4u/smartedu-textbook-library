@@ -1,3 +1,10 @@
+#[cfg(windows)]
+mod browser_download;
+mod download_file;
+mod response_route;
+#[cfg(windows)]
+use browser_download::start_browser_download;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,7 +21,6 @@ use std::{
 use tauri::{
     webview::DownloadEvent, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
-use tokio::io::AsyncReadExt;
 
 const VERSION_URL: &str =
     "https://s-file-2.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json";
@@ -98,6 +104,13 @@ struct BrowserDownloadFinished {
 
 type BrowserDownloadSender =
     Arc<Mutex<Option<tokio::sync::oneshot::Sender<BrowserDownloadFinished>>>>;
+
+fn download_receiver_active(sender: &BrowserDownloadSender) -> bool {
+    sender
+        .lock()
+        .map(|sender| sender.as_ref().is_some_and(|sender| !sender.is_closed()))
+        .unwrap_or(false)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -593,9 +606,7 @@ fn find_pdf_url(text: &str, content_id: &str) -> Option<String> {
 }
 
 fn contains_pdf_header(bytes: &[u8]) -> bool {
-    bytes
-        .windows(b"%PDF-".len())
-        .any(|window| window == b"%PDF-")
+    download_file::has_pdf_signature(bytes)
 }
 
 fn byte_preview(bytes: &[u8]) -> String {
@@ -661,6 +672,11 @@ async fn resolve_pdf(
         // discovered from the authenticated textbook detail page.
         .on_navigation(is_secure_url)
         .on_download(move |_webview, event| {
+            if cfg!(windows) {
+                // Windows response transport owns the file. Never allow a
+                // second browser download to write to the same destination.
+                return false;
+            }
             match event {
                 DownloadEvent::Requested { destination, .. } => {
                     *destination = callback_target.clone();
@@ -726,273 +742,6 @@ async fn resolve_pdf(
             Err(error)
         }
     }
-}
-
-#[cfg(windows)]
-async fn start_browser_download(
-    window: &WebviewWindow,
-    pdf_url: &str,
-    auth: &str,
-    referer: &str,
-    target: PathBuf,
-    finished_sender: BrowserDownloadSender,
-    response_started: Arc<AtomicBool>,
-    response_observation: Arc<Mutex<String>>,
-) -> Result<(), String> {
-    use std::io::Write;
-    use webview2_com::{
-        take_pwstr,
-        Microsoft::Web::WebView2::Win32::{
-            ICoreWebView2Environment9, ICoreWebView2_10, ICoreWebView2_2,
-        },
-        WebResourceResponseReceivedEventHandler, WebResourceResponseViewGetContentCompletedHandler,
-    };
-    use windows::Win32::System::Com::ISequentialStream;
-    use windows_core::{Interface, HSTRING, PWSTR};
-
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let sender = Mutex::new(Some(sender));
-    let pdf_url = pdf_url.to_string();
-    let auth = auth.to_string();
-    let referer = referer.to_string();
-    window
-        .with_webview(move |platform| {
-            let result = (|| unsafe {
-                let environment: ICoreWebView2Environment9 = platform
-                    .environment()
-                    .cast()
-                    .map_err(|error| error.to_string())?;
-                let webview: ICoreWebView2_10 = platform
-                    .controller()
-                    .CoreWebView2()
-                    .map_err(|error| error.to_string())?
-                    .cast()
-                    .map_err(|error| error.to_string())?;
-                let response_webview: ICoreWebView2_2 =
-                    webview.cast().map_err(|error| error.to_string())?;
-                let expected_url = pdf_url.clone();
-                let mut response_token = 0_i64;
-                response_webview
-                    .add_WebResourceResponseReceived(
-                        &WebResourceResponseReceivedEventHandler::create(Box::new(
-                            move |_sender, args| {
-                                let Some(args) = args else {
-                                    return Ok(());
-                                };
-                                let request = args.Request()?;
-                                let mut raw_uri = PWSTR::null();
-                                request.Uri(&mut raw_uri)?;
-                                let uri = take_pwstr(raw_uri);
-                                let request_headers = request.Headers()?;
-                                let mut raw_destination = PWSTR::null();
-                                let is_document = request_headers
-                                    .GetHeader(
-                                        &HSTRING::from("Sec-Fetch-Dest"),
-                                        &mut raw_destination,
-                                    )
-                                    .is_ok()
-                                    && take_pwstr(raw_destination).eq_ignore_ascii_case("document");
-                                let response = args.Response()?;
-                                let mut status = 0;
-                                response.StatusCode(&mut status)?;
-                                let headers = response.Headers()?;
-                                let mut raw_content_type = PWSTR::null();
-                                let content_type = if headers
-                                    .GetHeader(
-                                        &HSTRING::from("Content-Type"),
-                                        &mut raw_content_type,
-                                    )
-                                    .is_ok()
-                                {
-                                    take_pwstr(raw_content_type)
-                                } else {
-                                    String::new()
-                                };
-                                let expected_path = reqwest::Url::parse(&expected_url)
-                                    .ok()
-                                    .map(|url| url.path().to_ascii_lowercase());
-                                let actual_path = reqwest::Url::parse(&uri)
-                                    .ok()
-                                    .map(|url| url.path().to_ascii_lowercase());
-                                let same_path =
-                                    expected_path.is_some() && expected_path == actual_path;
-                                let pdf_type = content_type
-                                    .to_ascii_lowercase()
-                                    .contains("application/pdf");
-                                let pdf_path = actual_path
-                                    .as_deref()
-                                    .is_some_and(|path| path.ends_with(".pdf"));
-                                if uri != expected_url
-                                    && !same_path
-                                    && !pdf_type
-                                    && !pdf_path
-                                    && !is_document
-                                {
-                                    return Ok(());
-                                }
-                                if let Ok(mut observation) = response_observation.lock() {
-                                    *observation = format!(
-                                        "URL: {uri}；HTTP {status}；Content-Type: {}",
-                                        if content_type.is_empty() {
-                                            "未提供"
-                                        } else {
-                                            &content_type
-                                        }
-                                    );
-                                }
-                                if (300..400).contains(&status) {
-                                    return Ok(());
-                                }
-                                if !(200..300).contains(&status) {
-                                    if let Ok(mut sender) = finished_sender.lock() {
-                                        if let Some(sender) = sender.take() {
-                                            let _ = sender.send(BrowserDownloadFinished {
-                                                path: None,
-                                                success: false,
-                                                error: Some(format!(
-                                                    "WebView2 请求 PDF 失败：HTTP {status}"
-                                                )),
-                                            });
-                                        }
-                                    }
-                                    return Ok(());
-                                }
-                                let normalized_type = content_type.to_ascii_lowercase();
-                                if normalized_type.contains("text/html")
-                                    || normalized_type.contains("application/json")
-                                    || normalized_type.contains("text/json")
-                                {
-                                    return Ok(());
-                                }
-                                if response_started
-                                    .compare_exchange(
-                                        false,
-                                        true,
-                                        Ordering::Relaxed,
-                                        Ordering::Relaxed,
-                                    )
-                                    .is_err()
-                                {
-                                    return Ok(());
-                                }
-                                let content_sender = finished_sender.clone();
-                                let content_target = target.clone();
-                                let content_started = response_started.clone();
-                                let content_observation = response_observation.clone();
-                                let content_uri = uri.clone();
-                                let response_type = content_type.clone();
-                                response.GetContent(
-                                    &WebResourceResponseViewGetContentCompletedHandler::create(
-                                        Box::new(move |result, stream| {
-                                            let save_result = (|| -> Result<(), String> {
-                                                result.map_err(|error| error.to_string())?;
-                                                let stream = stream.ok_or_else(|| {
-                                                    "WebView2 未返回 PDF 响应流".to_string()
-                                                })?;
-                                                let stream: ISequentialStream = stream
-                                                    .cast()
-                                                    .map_err(|error| error.to_string())?;
-                                                let mut file =
-                                                    std::fs::File::create(&content_target)
-                                                        .map_err(|error| error.to_string())?;
-                                                let mut buffer = vec![0_u8; 64 * 1024];
-                                                let mut prefix = Vec::with_capacity(1024);
-                                                loop {
-                                                    let mut read = 0_u32;
-                                                    stream
-                                                        .Read(
-                                                            buffer.as_mut_ptr().cast(),
-                                                            buffer.len() as u32,
-                                                            Some(&mut read),
-                                                        )
-                                                        .ok()
-                                                        .map_err(|error| error.to_string())?;
-                                                    if read == 0 {
-                                                        break;
-                                                    }
-                                                    if prefix.len() < 1024 {
-                                                        let remaining = 1024 - prefix.len();
-                                                        prefix.extend_from_slice(
-                                                            &buffer[..(read as usize).min(remaining)],
-                                                        );
-                                                    }
-                                                    file.write_all(&buffer[..read as usize])
-                                                        .map_err(|error| error.to_string())?;
-                                                }
-                                                file.flush().map_err(|error| error.to_string())?;
-                                                if !contains_pdf_header(&prefix) {
-                                                    return Err(format!(
-                                                        "响应不是 PDF；URL: {content_uri}；Content-Type: {}；文件头: {}",
-                                                        if response_type.is_empty() {
-                                                            "未提供"
-                                                        } else {
-                                                            &response_type
-                                                        },
-                                                        byte_preview(&prefix)
-                                                    ));
-                                                }
-                                                Ok(())
-                                            })(
-                                            );
-                                            if let Err(error) = &save_result {
-                                                let _ = std::fs::remove_file(&content_target);
-                                                if let Ok(mut observation) =
-                                                    content_observation.lock()
-                                                {
-                                                    *observation = error.clone();
-                                                }
-                                                content_started.store(false, Ordering::Relaxed);
-                                                return Ok(());
-                                            }
-                                            if let Ok(mut sender) = content_sender.lock() {
-                                                if let Some(sender) = sender.take() {
-                                                    let _ = sender.send(BrowserDownloadFinished {
-                                                        path: save_result
-                                                            .as_ref()
-                                                            .ok()
-                                                            .map(|_| content_target.clone()),
-                                                        success: save_result.is_ok(),
-                                                        error: save_result.err(),
-                                                    });
-                                                }
-                                            }
-                                            Ok(())
-                                        }),
-                                    ),
-                                )?;
-                                Ok(())
-                            },
-                        )),
-                        &mut response_token,
-                    )
-                    .map_err(|error| error.to_string())?;
-                let mut headers = format!("Referer: {referer}\r\nAccept: application/pdf,*/*\r\n");
-                if !auth.is_empty() {
-                    headers.push_str(&format!("X-Nd-Auth: {auth}\r\n"));
-                }
-                let request = environment
-                    .CreateWebResourceRequest(
-                        &HSTRING::from(pdf_url),
-                        &HSTRING::from("GET"),
-                        None,
-                        &HSTRING::from(headers),
-                    )
-                    .map_err(|error| error.to_string())?;
-                webview
-                    .NavigateWithWebResourceRequest(&request)
-                    .map_err(|error| error.to_string())
-            })();
-            if let Ok(mut sender) = sender.lock() {
-                if let Some(sender) = sender.take() {
-                    let _ = sender.send(result);
-                }
-            }
-        })
-        .map_err(|error| error.to_string())?;
-    tokio::time::timeout(Duration::from_secs(5), receiver)
-        .await
-        .map_err(|_| "启动 WebView2 下载请求超时".to_string())?
-        .map_err(|_| "教材详情窗口提前关闭".to_string())?
 }
 
 #[cfg(not(windows))]
@@ -1220,7 +969,7 @@ async fn download_single(
     let referer = detail_url(&resource)
         .map_err(DownloadFailure::Failed)?
         .to_string();
-    start_browser_download(
+    let start_result = start_browser_download(
         &detail_window,
         &pdf_url,
         &auth,
@@ -1230,8 +979,11 @@ async fn download_single(
         download_started.clone(),
         response_observation.clone(),
     )
-    .await
-    .map_err(DownloadFailure::Failed)?;
+    .await;
+    if let Err(error) = start_result {
+        let _ = detail_window.close();
+        return Err(DownloadFailure::Failed(error));
+    }
     report_progress(
         &app,
         &task_id,
@@ -1259,6 +1011,12 @@ async fn download_single(
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
         let started = download_started.load(Ordering::Relaxed);
+        if waiting_since.elapsed() > Duration::from_secs(300) {
+            let _ = detail_window.close();
+            return Err(DownloadFailure::Failed(
+                "浏览器传输超过五分钟，任务已停止；可重试该教材".into(),
+            ));
+        }
         if !started && waiting_since.elapsed() > Duration::from_secs(30) {
             let _ = detail_window.close();
             let observation = response_observation
@@ -1324,41 +1082,15 @@ async fn download_single(
         Some(received),
         Some(total),
     );
-    let mut file = tokio::fs::File::open(&part)
-        .await
-        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
-    let mut header = [0_u8; 1024];
-    let header_size = file
-        .read(&mut header)
-        .await
-        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
-    let size = file
-        .metadata()
-        .await
-        .map_err(|error| DownloadFailure::Failed(error.to_string()))?
-        .len();
-    if !contains_pdf_header(&header[..header_size]) {
-        let observation = response_observation
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        let _ = tokio::fs::remove_file(&part).await;
-        return Err(DownloadFailure::Failed(format!(
-            "下载内容不是 PDF 文件（{observation}；文件头: {}）",
-            byte_preview(&header[..header_size])
-        )));
-    }
-    if resource.size_bytes > 0 && size != resource.size_bytes {
-        let _ = tokio::fs::remove_file(&part).await;
-        return Err(DownloadFailure::Failed(format!(
-            "文件大小校验失败：期望 {}，实际 {}",
-            resource.size_bytes, size
-        )));
-    }
-    let _ = tokio::fs::remove_file(&target).await;
-    tokio::fs::rename(&part, &target)
-        .await
-        .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
+    let commit_part = part.clone();
+    let commit_target = target.clone();
+    let expected_size = resource.size_bytes;
+    let size = tauri::async_runtime::spawn_blocking(move || {
+        download_file::validate_and_commit(&commit_part, &commit_target, expected_size)
+    })
+    .await
+    .map_err(|error| DownloadFailure::Failed(error.to_string()))?
+    .map_err(|error| DownloadFailure::Failed(format!("教材文件校验或保存失败：{error}")))?;
     save_library_item(
         &app,
         LibraryItem {
@@ -2135,7 +1867,7 @@ mod tests {
     #[test]
     fn recognizes_pdf_header_within_initial_bytes() {
         assert!(contains_pdf_header(b"%PDF-1.7\n"));
-        assert!(contains_pdf_header(b"\xef\xbb\xbf%PDF-1.7\n"));
+        assert!(!contains_pdf_header(b"\xef\xbb\xbf%PDF-1.7\n"));
         assert!(!contains_pdf_header(b"<!doctype html>"));
     }
 

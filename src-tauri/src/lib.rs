@@ -1178,11 +1178,26 @@ fn update_settings(
     settings: SettingsPatch,
     state: tauri::State<'_, AppState>,
 ) -> Result<AppSettings, String> {
-    let mut current = state.settings.lock().map_err(|error| error.to_string())?;
+    let queue = state.queue.lock().map_err(|error| error.to_string())?;
+    if settings.filename_template.is_some()
+        && (queue.status == "running" || queue.status == "paused")
+    {
+        return Err("下载任务进行中，不能修改文件名格式".into());
+    }
+    let mut saved = state.settings.lock().map_err(|error| error.to_string())?;
+    let mut current = saved.clone();
     if let Some(value) = settings.filename_template {
-        current.filename_template = value;
+        let value = value.trim();
+        current.filename_template = if value.is_empty() {
+            default_settings(current.default_download_directory.clone()).filename_template
+        } else {
+            value.chars().take(240).collect()
+        };
     }
     if let Some(value) = settings.startup_filter_mode {
+        if !matches!(value.as_str(), "defaults" | "last") {
+            return Err("无效的启动筛选模式".into());
+        }
         current.startup_filter_mode = value;
     }
     if let Some(value) = settings.default_filters {
@@ -1198,6 +1213,9 @@ fn update_settings(
         current.last_skip_downloaded = value;
     }
     if let Some(value) = settings.default_view {
+        if !matches!(value.as_str(), "catalog" | "tasks" | "library" | "settings") {
+            return Err("无效的默认页面".into());
+        }
         current.default_view = value;
     }
     if let Some(value) = settings.download_notifications {
@@ -1205,10 +1223,11 @@ fn update_settings(
     }
     fs::write(
         &state.settings_path,
-        serde_json::to_string_pretty(&*current).map_err(|error| error.to_string())?,
+        serde_json::to_string_pretty(&current).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    Ok(current.clone())
+    *saved = current.clone();
+    Ok(current)
 }
 
 #[tauri::command]

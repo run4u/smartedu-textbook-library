@@ -8,6 +8,10 @@ pub(super) struct RequestProbe {
 }
 
 impl RequestProbe {
+    pub fn has_auth(&self) -> bool {
+        !self.headers.is_empty()
+    }
+
     pub fn remember(&mut self, url: String, auth: String) {
         if !self.urls.contains(&url) {
             if self.urls.len() >= 512 {
@@ -41,10 +45,14 @@ pub(super) async fn install(
     probe: Arc<Mutex<RequestProbe>>,
 ) -> Result<(), String> {
     use webview2_com::{
-        take_pwstr, Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+        take_pwstr,
+        Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2_22, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+            COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+        },
         WebResourceRequestedEventHandler,
     };
-    use windows_core::{HSTRING, PWSTR};
+    use windows_core::{Interface, HSTRING, PWSTR};
     let (sender, receiver) = tokio::sync::oneshot::channel();
     window
         .with_webview(move |platform| {
@@ -83,6 +91,15 @@ pub(super) async fn install(
                         &mut token,
                     )
                     .map_err(|error| error.to_string())?;
+                if let Ok(modern) = webview.cast::<ICoreWebView2_22>() {
+                    return modern
+                        .AddWebResourceRequestedFilterWithRequestSourceKinds(
+                            &HSTRING::from("*"),
+                            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                            COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+                        )
+                        .map_err(|error| error.to_string());
+                }
                 webview
                     .AddWebResourceRequestedFilter(
                         &HSTRING::from("*"),

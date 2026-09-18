@@ -74,6 +74,7 @@ const READ_DETAIL_PROBE_SCRIPT: &str = r#"
   const performanceUrls = performance.getEntriesByType('resource').map((entry) => entry.name);
   return {
     html: document.documentElement ? document.documentElement.outerHTML : '',
+    title: document.title || '',
     auth: state.auth || '',
     urls: Array.from(new Set([...(state.urls || []), ...performanceUrls]))
   };
@@ -229,6 +230,8 @@ struct LibraryItem {
 #[derive(Deserialize)]
 struct DetailProbe {
     html: String,
+    #[serde(default)]
+    title: String,
     auth: String,
     urls: Vec<String>,
 }
@@ -756,7 +759,19 @@ async fn resolve_pdf(
         let mut last_auth = String::new();
         let mut last_url_count = 0;
         let mut saw_auth = false;
-        while started.elapsed() < Duration::from_secs(30) {
+        let mut last_title = String::new();
+        let mut shown = false;
+        while started.elapsed() < Duration::from_secs(180) {
+            if !shown && started.elapsed() >= Duration::from_secs(15) {
+                window.set_title("请确认登录并打开教材阅读页面，识别后将自动继续下载")
+                    .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
+                window.show().map_err(|error| DownloadFailure::Failed(error.to_string()))?;
+                let _ = window.set_focus();
+                shown = true;
+            }
+            if app.get_webview_window(&label).is_none() {
+                return Err(DownloadFailure::Failed("教材详情窗口已关闭；请重试并完成平台登录或阅读确认".into()));
+            }
             tokio::time::sleep(Duration::from_millis(500)).await;
             let directive = signal.load(Ordering::Relaxed);
             if directive != DOWNLOAD_RUNNING {
@@ -764,10 +779,11 @@ async fn resolve_pdf(
             }
             let probe = match read_detail_probe(&window).await {
                 Ok(value) => value,
-                Err(_) => DetailProbe { html: String::new(), auth: String::new(), urls: Vec::new() },
+                Err(_) => DetailProbe { html: String::new(), title: String::new(), auth: String::new(), urls: Vec::new() },
             };
             if !probe.auth.is_empty() { last_auth = probe.auth.clone(); }
-            saw_auth |= !last_auth.is_empty();
+            if !probe.title.is_empty() { last_title = probe.title.chars().take(80).collect(); }
+            saw_auth |= !last_auth.is_empty() || native_probe.lock().map(|probe| probe.has_auth()).unwrap_or(false);
             let native_urls = native_probe.lock().map(|probe| probe.urls.clone()).unwrap_or_default();
             last_url_count = probe.urls.len() + native_urls.len();
             let mut searchable = probe.html;
@@ -791,7 +807,7 @@ async fn resolve_pdf(
             }
         }
         Err(DownloadFailure::Failed(format!(
-            "未能从教材详情解析到 PDF 地址（捕获请求 {last_url_count} 个，授权信息{}）；请确认登录状态和资源权限",
+            "未能从教材详情解析到 PDF 地址（捕获请求 {last_url_count} 个，授权信息{}）；页面标题：{last_title}；请在弹出的详情页完成登录或阅读确认后重试",
             if saw_auth { "已出现" } else { "未出现" }
         )))
     }

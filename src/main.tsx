@@ -178,20 +178,24 @@ function App() {
   const openLogin = async () => {
     const desktopBridge = bridge();
     if (desktopBridge?.login) {
+      try {
       const result = await desktopBridge.login();
       setHasSavedSession(result.hasSavedSession);
       setSessionChecked(true);
       setLoginMessage(result.hasSavedSession ? (result.autoClosed ? '登录完成，已自动返回' : '登录窗口已关闭，登录档案已保存') : '登录窗口已关闭，未检测到登录档案');
+      } catch (error) { setLoginMessage(error instanceof Error ? error.message : String(error)); }
     }
   };
   const logout = async () => {
     if (!window.confirm('确认清除本应用保存的平台登录档案？')) return;
     const desktopBridge = bridge();
     if (desktopBridge?.clearSession) {
+      try {
       await desktopBridge.clearSession();
       setHasSavedSession(false);
       setSessionChecked(true);
       setLoginMessage('登录档案已清除');
+      } catch (error) { setLoginMessage(error instanceof Error ? error.message : String(error)); }
     }
   };
 
@@ -249,7 +253,7 @@ function App() {
   };
   const chooseDirectory = async () => { const desktopBridge = bridge(); if (!desktopBridge?.chooseDownloadDirectory) return; try { setSettings(await desktopBridge.chooseDownloadDirectory()); setSettingsMessage('下载目录已更新'); } catch (error) { setSettingsMessage(error instanceof Error ? error.message : String(error)); } };
   const resetDirectory = async () => { const desktopBridge = bridge(); if (!desktopBridge?.resetDownloadDirectory) return; try { setSettings(await desktopBridge.resetDownloadDirectory()); setSettingsMessage('已恢复默认下载目录'); } catch (error) { setSettingsMessage(error instanceof Error ? error.message : String(error)); } };
-  const openDirectory = async () => { const desktopBridge = bridge(); if (desktopBridge?.openDownloadDirectory) await desktopBridge.openDownloadDirectory(); };
+  const openDirectory = async () => { const desktopBridge = bridge(); try { if (desktopBridge?.openDownloadDirectory) { const message = await desktopBridge.openDownloadDirectory(); if (message) setSettingsMessage(message); } } catch (error) { setSettingsMessage(error instanceof Error ? error.message : String(error)); } };
   const clearAllRecords = async () => { if (!window.confirm('确认清除全部下载任务记录和历史？不会删除已下载教材。')) return; const desktopBridge = bridge(); if (desktopBridge?.clearAllTaskRecords) { try { setQueue(await desktopBridge.clearAllTaskRecords()); setSettingsMessage('下载任务记录已清除'); } catch (error) { setSettingsMessage(error instanceof Error ? error.message : String(error)); } } };
   const updateFilterSetting = (kind: 'defaultFilters' | 'lastFilters', field: keyof AppSettings['defaultFilters'], value: string) => { if (!settings) return; const next = { ...settings[kind], [field]: value }; setSettings({ ...settings, [kind]: next }); void updateAppSettings({ [kind]: next }); };
 
@@ -288,12 +292,16 @@ function App() {
   const openLibraryFile = async (item: LibraryItem) => {
     const desktopBridge = bridge();
     if (!desktopBridge?.openLibraryFile || !item.exists) return;
-    const errorMessage = await desktopBridge.openLibraryFile(item.path);
-    if (errorMessage) setLibraryMessage(errorMessage);
+    try {
+      const errorMessage = await desktopBridge.openLibraryFile(item.path);
+      if (errorMessage) setLibraryMessage(errorMessage);
+    } catch (error) { setLibraryMessage(error instanceof Error ? error.message : String(error)); }
   };
   const showLibraryInFolder = async (item: LibraryItem) => {
     const desktopBridge = bridge();
-    if (desktopBridge?.showLibraryInFolder) await desktopBridge.showLibraryInFolder(item.path);
+    try {
+      if (desktopBridge?.showLibraryInFolder) await desktopBridge.showLibraryInFolder(item.path);
+    } catch (error) { setLibraryMessage(error instanceof Error ? error.message : String(error)); }
   };
 
   return <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>

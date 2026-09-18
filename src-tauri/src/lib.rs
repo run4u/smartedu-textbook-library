@@ -1,6 +1,7 @@
 #[cfg(windows)]
 mod browser_download;
 mod download_file;
+mod request_probe;
 mod response_route;
 #[cfg(windows)]
 use browser_download::start_browser_download;
@@ -13,7 +14,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -265,6 +266,35 @@ fn now_string() -> String {
         .to_string()
 }
 
+fn attempt_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        now_string(),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+struct AttemptFile(PathBuf);
+impl Drop for AttemptFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn ensure_worker_stopped(state: &AppState) -> Result<(), String> {
+    if state
+        .queue_runtime
+        .lock()
+        .map_err(|error| error.to_string())?
+        .worker_active
+    {
+        return Err("上一项下载正在结束，请稍后重试".into());
+    }
+    Ok(())
+}
+
 fn iso_now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -495,13 +525,17 @@ fn mark_downloaded(resources: &mut [TextbookResource], library_path: &PathBuf) {
         .map(|item| item.content_id)
         .collect();
     for resource in resources {
-        if downloaded.contains(&resource.content_id) {
-            resource.local_state = "downloaded".into();
+        resource.local_state = if downloaded.contains(&resource.content_id) {
+            "downloaded"
+        } else {
+            "not-downloaded"
         }
+        .into();
     }
 }
 
 fn is_credential_cookie_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
     name == "UC_TOKEN"
         || name.starts_with("UC_TOKEN-")
         || name == "UC_SSO_TGC"
@@ -540,7 +574,12 @@ fn session_cookie_values(window: &WebviewWindow) -> Result<HashMap<String, Strin
             cookies
                 .into_iter()
                 .filter(|cookie| {
-                    is_platform_domain(cookie.domain()) && is_credential_cookie_name(cookie.name())
+                    is_platform_domain(cookie.domain())
+                        && is_credential_cookie_name(cookie.name())
+                        && !cookie.value().is_empty()
+                        && cookie
+                            .expires_datetime()
+                            .map_or(true, |expires| expires > time::OffsetDateTime::now_utc())
                 })
                 .map(|cookie| {
                     let key = format!(
@@ -583,26 +622,30 @@ fn find_pdf_url(text: &str, content_id: &str) -> Option<String> {
         .find_iter(&normalized)
         .map(|item| item.as_str())
         .collect();
-    let scoped: Vec<&str> = urls
-        .iter()
-        .copied()
-        .filter(|url| url.contains(content_id))
-        .collect();
-    let candidates = if scoped.is_empty() { &urls } else { &scoped };
-    for raw in candidates {
+    let mut candidates = Vec::new();
+    for raw in urls {
         let Ok(url) = reqwest::Url::parse(raw) else {
             continue;
         };
-        if url.path().to_ascii_lowercase().ends_with("viewer.html") {
-            if let Some((_, value)) = url.query_pairs().find(|(name, _)| name == "file") {
-                return Some(value.into_owned());
-            }
-        }
-        if url.path().to_ascii_lowercase().ends_with(".pdf") {
-            return Some(url.to_string());
+        let candidate = if url.path().to_ascii_lowercase().ends_with("viewer.html") {
+            url.query_pairs()
+                .find(|(name, _)| name == "file")
+                .and_then(|(_, value)| url.join(&value).ok())
+        } else if url.path().to_ascii_lowercase().ends_with(".pdf") {
+            Some(url)
+        } else {
+            None
+        };
+        if let Some(candidate) = candidate.filter(is_secure_url) {
+            candidates.push(candidate.to_string());
         }
     }
-    None
+    // Rank actual PDF candidates, not every URL containing the content ID.
+    candidates
+        .iter()
+        .find(|url| url.contains(content_id))
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
 }
 
 fn contains_pdf_header(bytes: &[u8]) -> bool {
@@ -654,7 +697,7 @@ async fn resolve_pdf(
     ),
     DownloadFailure,
 > {
-    let label = format!("smartedu-detail-{}", now_string());
+    let label = format!("smartedu-detail-{}", attempt_id());
     let detail = detail_url(resource).map_err(DownloadFailure::Failed)?;
     let (download_sender, download_receiver) = tokio::sync::oneshot::channel();
     let download_sender: BrowserDownloadSender = Arc::new(Mutex::new(Some(download_sender)));
@@ -663,46 +706,57 @@ async fn resolve_pdf(
     let response_observation = Arc::new(Mutex::new(String::new()));
     let callback_started = download_started.clone();
     let callback_target = download_target.clone();
-    let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(detail))
-        .title("正在解析教材详情")
-        .visible(false)
-        .initialization_script(DETAIL_PROBE_SCRIPT)
-        // The platform can redirect textbook PDFs to CDN hosts outside the
-        // login-domain allowlist. This hidden window only follows HTTPS URLs
-        // discovered from the authenticated textbook detail page.
-        .on_navigation(is_secure_url)
-        .on_download(move |_webview, event| {
-            if cfg!(windows) {
-                // Windows response transport owns the file. Never allow a
-                // second browser download to write to the same destination.
-                return false;
+    let native_probe = Arc::new(Mutex::new(request_probe::RequestProbe::default()));
+    // Install native request hooks before the first platform navigation.
+    let window = WebviewWindowBuilder::new(
+        app,
+        &label,
+        WebviewUrl::External("about:blank".parse().unwrap()),
+    )
+    .title("正在解析教材详情")
+    .visible(false)
+    .initialization_script(DETAIL_PROBE_SCRIPT)
+    // The platform can redirect textbook PDFs to CDN hosts outside the
+    // login-domain allowlist. This hidden window only follows HTTPS URLs
+    // discovered from the authenticated textbook detail page.
+    .on_navigation(|url| url.as_str() == "about:blank" || is_secure_url(url))
+    .on_download(move |_webview, event| {
+        if cfg!(windows) {
+            // Windows response transport owns the file. Never allow a
+            // second browser download to write to the same destination.
+            return false;
+        }
+        match event {
+            DownloadEvent::Requested { destination, .. } => {
+                *destination = callback_target.clone();
+                callback_started.store(true, Ordering::Relaxed);
             }
-            match event {
-                DownloadEvent::Requested { destination, .. } => {
-                    *destination = callback_target.clone();
-                    callback_started.store(true, Ordering::Relaxed);
-                }
-                DownloadEvent::Finished { path, success, .. } => {
-                    if let Ok(mut sender) = callback_sender.lock() {
-                        if let Some(sender) = sender.take() {
-                            let _ = sender.send(BrowserDownloadFinished {
-                                path,
-                                success,
-                                error: None,
-                            });
-                        }
+            DownloadEvent::Finished { path, success, .. } => {
+                if let Ok(mut sender) = callback_sender.lock() {
+                    if let Some(sender) = sender.take() {
+                        let _ = sender.send(BrowserDownloadFinished {
+                            path,
+                            success,
+                            error: None,
+                        });
                     }
                 }
-                _ => {}
             }
-            true
-        })
-        .build()
-        .map_err(|error| DownloadFailure::Failed(format!("创建教材详情窗口失败：{error}")))?;
+            _ => {}
+        }
+        true
+    })
+    .build()
+    .map_err(|error| DownloadFailure::Failed(format!("创建教材详情窗口失败：{error}")))?;
     let result = async {
+        #[cfg(windows)]
+        request_probe::install(&window, native_probe.clone()).await.map_err(DownloadFailure::Failed)?;
+        window.navigate(detail).map_err(|error| DownloadFailure::Failed(error.to_string()))?;
+        let started = std::time::Instant::now();
+        let mut last_auth = String::new();
         let mut last_url_count = 0;
         let mut saw_auth = false;
-        for _ in 0..24 {
+        while started.elapsed() < Duration::from_secs(30) {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let directive = signal.load(Ordering::Relaxed);
             if directive != DOWNLOAD_RUNNING {
@@ -710,15 +764,30 @@ async fn resolve_pdf(
             }
             let probe = match read_detail_probe(&window).await {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(_) => DetailProbe { html: String::new(), auth: String::new(), urls: Vec::new() },
             };
-            last_url_count = probe.urls.len();
-            saw_auth |= !probe.auth.is_empty();
+            if !probe.auth.is_empty() { last_auth = probe.auth.clone(); }
+            saw_auth |= !last_auth.is_empty();
+            let native_urls = native_probe.lock().map(|probe| probe.urls.clone()).unwrap_or_default();
+            last_url_count = probe.urls.len() + native_urls.len();
             let mut searchable = probe.html;
             searchable.push('\n');
             searchable.push_str(&probe.urls.join("\n"));
+            searchable.push('\n');
+            searchable.push_str(&native_urls.join("\n"));
             if let Some(pdf_url) = find_pdf_url(&searchable, &resource.content_id) {
-                return Ok((pdf_url, probe.auth));
+                let exact_auth = native_probe.lock().ok().and_then(|probe| probe.auth_for(&pdf_url));
+                // A viewer URL can appear before its authenticated fetch runs.
+                // Prefer the target request's header, including requests in frames.
+                if let Some(auth) = exact_auth { return Ok((pdf_url, auth)); }
+                if started.elapsed() >= Duration::from_secs(6) {
+                    // Windows uses only a header observed on this exact request.
+                    // Public/signed PDFs may legitimately use cookies without it.
+                    #[cfg(windows)]
+                    return Ok((pdf_url, String::new()));
+                    #[cfg(not(windows))]
+                    return Ok((pdf_url, last_auth.clone()));
+                }
             }
         }
         Err(DownloadFailure::Failed(format!(
@@ -955,8 +1024,13 @@ async fn download_single(
         .await
         .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
     let target = directory.join(output_filename(&resource, &settings.filename_template));
-    let part = PathBuf::from(format!("{}.part", target.to_string_lossy()));
-    let _ = tokio::fs::remove_file(&part).await;
+    // A delayed callback must never overwrite or remove another attempt's file.
+    let part = PathBuf::from(format!(
+        "{}.{}.part",
+        target.to_string_lossy(),
+        attempt_id()
+    ));
+    let _attempt_file = AttemptFile(part.clone());
     let (
         pdf_url,
         auth,
@@ -969,6 +1043,12 @@ async fn download_single(
     let referer = detail_url(&resource)
         .map_err(DownloadFailure::Failed)?
         .to_string();
+    let directive = signal.load(Ordering::Relaxed);
+    if directive != DOWNLOAD_RUNNING {
+        download_receiver.close();
+        let _ = detail_window.close();
+        return Err(DownloadFailure::Interrupted(directive));
+    }
     let start_result = start_browser_download(
         &detail_window,
         &pdf_url,
@@ -981,6 +1061,7 @@ async fn download_single(
     )
     .await;
     if let Err(error) = start_result {
+        download_receiver.close();
         let _ = detail_window.close();
         return Err(DownloadFailure::Failed(error));
     }
@@ -996,6 +1077,7 @@ async fn download_single(
     let finished = loop {
         let directive = signal.load(Ordering::Relaxed);
         if directive != DOWNLOAD_RUNNING {
+            download_receiver.close();
             let _ = detail_window.close();
             if directive == DOWNLOAD_CANCELED {
                 let _ = tokio::fs::remove_file(&part).await;
@@ -1012,12 +1094,14 @@ async fn download_single(
         }
         let started = download_started.load(Ordering::Relaxed);
         if waiting_since.elapsed() > Duration::from_secs(300) {
+            download_receiver.close();
             let _ = detail_window.close();
             return Err(DownloadFailure::Failed(
                 "浏览器传输超过五分钟，任务已停止；可重试该教材".into(),
             ));
         }
         if !started && waiting_since.elapsed() > Duration::from_secs(30) {
+            download_receiver.close();
             let _ = detail_window.close();
             let observation = response_observation
                 .lock()
@@ -1262,6 +1346,8 @@ async fn open_login(app: tauri::AppHandle) -> Result<SessionStatus, String> {
         .map_err(|error| error.to_string())?;
     }
     let mut auto_closed = false;
+    let mut stable_credentials = HashMap::new();
+    let mut stable_since = std::time::Instant::now();
     while app.get_webview_window("smartedu-login").is_some() {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let Some(window) = app.get_webview_window("smartedu-login") else {
@@ -1273,7 +1359,28 @@ async fn open_login(app: tauri::AppHandle) -> Result<SessionStatus, String> {
         let has_new_credential = current
             .iter()
             .any(|(key, value)| baseline.get(key) != Some(value));
-        if has_new_credential {
+        // SSO tickets can arrive before the textbook application's token.
+        // Keep the window alive until the redirect completes and cookies settle.
+        if current != stable_credentials {
+            stable_credentials = current.clone();
+            stable_since = std::time::Instant::now();
+        }
+        let ready = window.url().ok().is_some_and(|url| {
+            url.scheme() == "https" && url.host_str() == Some("basic.smartedu.cn")
+        });
+        let has_app_token = current.keys().any(|key| {
+            let name = key
+                .rsplit(':')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            name == "UC_TOKEN" || name.starts_with("UC_TOKEN-")
+        });
+        if has_new_credential
+            && has_app_token
+            && ready
+            && stable_since.elapsed() >= Duration::from_secs(3)
+        {
             auto_closed = true;
             window.close().map_err(|error| error.to_string())?;
         }
@@ -1285,6 +1392,14 @@ async fn open_login(app: tauri::AppHandle) -> Result<SessionStatus, String> {
 
 #[tauri::command]
 async fn clear_session(app: tauri::AppHandle) -> Result<SessionStatus, String> {
+    {
+        let state = app.state::<AppState>();
+        let queue = state.queue.lock().map_err(|error| error.to_string())?;
+        if queue.status == "running" || queue.status == "paused" {
+            return Err("请先取消下载任务，再清除登录状态".into());
+        }
+        ensure_worker_stopped(&state)?;
+    }
     cookie_window(&app)?
         .clear_all_browsing_data()
         .map_err(|error| error.to_string())?;
@@ -1360,7 +1475,14 @@ async fn run_queue_worker(app: tauri::AppHandle) {
                 task.started_at = Some(iso_now());
                 task.completed_at = None;
                 task.updated_at = Some(iso_now());
-                (Some((task.id.clone(), task.resource.clone())), false)
+                let signal = Arc::new(AtomicU8::new(DOWNLOAD_RUNNING));
+                if let Ok(mut runtime) = state.queue_runtime.lock() {
+                    runtime.active_signal = Some(signal.clone());
+                }
+                (
+                    Some((task.id.clone(), task.resource.clone(), signal)),
+                    false,
+                )
             } else {
                 queue.status = "complete".into();
                 (None, true)
@@ -1371,16 +1493,12 @@ async fn run_queue_worker(app: tauri::AppHandle) {
             emit_queue(&app);
             return;
         }
-        let Some((task_id, resource)) = next else {
+        let Some((task_id, resource, signal)) = next else {
             return;
         };
         persist_queue(&app);
         emit_queue(&app);
 
-        let signal = Arc::new(AtomicU8::new(DOWNLOAD_RUNNING));
-        if let Ok(mut runtime) = app.state::<AppState>().queue_runtime.lock() {
-            runtime.active_signal = Some(signal.clone());
-        }
         let result = download_single(app.clone(), resource, task_id.clone(), signal).await;
         if let Ok(mut runtime) = app.state::<AppState>().queue_runtime.lock() {
             runtime.active_signal = None;
@@ -1461,12 +1579,13 @@ async fn start_download(
     let created_at = iso_now();
     let state = app.state::<AppState>();
     let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+    ensure_worker_stopped(&state)?;
     if queue.status == "running" || queue.status == "paused" {
         return Err("已有正在进行的下载任务，请先暂停、取消或等待其完成".into());
     }
     archive_current(&mut queue);
     let history = std::mem::take(&mut queue.history);
-    let batch_stamp = now_string();
+    let batch_stamp = attempt_id();
     *queue = QueueState {
         batch_id: Some(format!("lite-batch-{batch_stamp}")),
         status: "running".into(),
@@ -1602,6 +1721,7 @@ fn retry_task(task_id: String, app: tauri::AppHandle) -> Result<QueueState, Stri
     let snapshot = {
         let state = app.state::<AppState>();
         let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+        ensure_worker_stopped(&state)?;
         if queue.status == "running" || queue.status == "paused" {
             return Err("当前批次正在运行，无法重试".into());
         }
@@ -1630,6 +1750,7 @@ fn retry_all_tasks(app: tauri::AppHandle) -> Result<QueueState, String> {
     let snapshot = {
         let state = app.state::<AppState>();
         let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+        ensure_worker_stopped(&state)?;
         if queue.status == "running" || queue.status == "paused" {
             return Err("当前批次正在运行，无法重试".into());
         }
@@ -1660,6 +1781,7 @@ fn retry_all_tasks(app: tauri::AppHandle) -> Result<QueueState, String> {
 fn clear_finished_tasks(app: tauri::AppHandle) -> Result<QueueState, String> {
     let state = app.state::<AppState>();
     let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+    ensure_worker_stopped(&state)?;
     if queue.status == "complete" || queue.status == "canceled" {
         queue.tasks.retain(|task| {
             task.status != "complete" && task.status != "error" && task.status != "canceled"
@@ -1692,6 +1814,7 @@ async fn clear_all_task_records(app: tauri::AppHandle) -> Result<QueueState, Str
     let state = app.state::<AppState>();
     let (resources, settings) = {
         let mut queue = state.queue.lock().map_err(|error| error.to_string())?;
+        ensure_worker_stopped(&state)?;
         if queue.status == "running" || queue.status == "paused" {
             return Err("下载任务进行中，无法清除任务记录".into());
         }
@@ -1725,30 +1848,109 @@ fn list_library(state: tauri::State<'_, AppState>) -> Vec<LibraryItem> {
     }
     items
 }
-#[tauri::command]
-fn choose_download_directory(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
-    get_settings(state)
+fn save_download_directory(state: &AppState, directory: String) -> Result<AppSettings, String> {
+    let queue = state.queue.lock().map_err(|error| error.to_string())?;
+    if queue.status == "running" || queue.status == "paused" {
+        return Err("下载任务进行中，不能修改下载目录".into());
+    }
+    ensure_worker_stopped(state)?;
+    let mut saved = state.settings.lock().map_err(|error| error.to_string())?;
+    let mut current = saved.clone();
+    current.download_directory = directory;
+    current.effective_download_directory = if current.download_directory.is_empty() {
+        current.default_download_directory.clone()
+    } else {
+        current.download_directory.clone()
+    };
+    fs::create_dir_all(&current.effective_download_directory).map_err(|error| error.to_string())?;
+    fs::write(
+        &state.settings_path,
+        serde_json::to_vec_pretty(&current).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    *saved = current.clone();
+    Ok(current)
 }
+
+#[tauri::command]
+async fn choose_download_directory(app: tauri::AppHandle) -> Result<AppSettings, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |folder| {
+        let _ = sender.send(folder);
+    });
+    let folder = receiver.await.map_err(|error| error.to_string())?;
+    let state = app.state::<AppState>();
+    match folder {
+        Some(folder) => save_download_directory(
+            &state,
+            folder
+                .into_path()
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        None => get_settings(state),
+    }
+}
+
 #[tauri::command]
 fn reset_download_directory(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
-    get_settings(state)
+    save_download_directory(&state, String::new())
 }
+
 #[tauri::command]
-fn open_download_directory() -> Result<String, String> {
-    Err("轻量版原型尚未接入系统目录打开能力".into())
+fn open_download_directory(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let settings = get_settings(app.state::<AppState>())?;
+    fs::create_dir_all(&settings.effective_download_directory)
+        .map_err(|error| error.to_string())?;
+    app.opener()
+        .open_path(&settings.effective_download_directory, None::<&str>)
+        .map_err(|error| error.to_string())?;
+    Ok(String::new())
 }
-#[tauri::command]
-fn open_library_file(_file_path: String) -> Result<String, String> {
-    Err("轻量版原型尚未接入系统文件打开能力".into())
+
+fn library_file(state: &AppState, file_path: &str) -> Result<PathBuf, String> {
+    let items: Vec<LibraryItem> = serde_json::from_str(
+        &fs::read_to_string(&state.library_path).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if !items.iter().any(|item| item.path == file_path) {
+        return Err("文件不在本地教材库中".into());
+    }
+    let path = PathBuf::from(file_path);
+    if !path.is_file() {
+        return Err("教材文件已不存在，请刷新教材库".into());
+    }
+    Ok(path)
 }
+
 #[tauri::command]
-fn show_library_in_folder(_file_path: String) -> Result<Value, String> {
-    Err("轻量版原型尚未接入文件定位能力".into())
+fn open_library_file(file_path: String, app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = library_file(&app.state::<AppState>(), &file_path)?;
+    app.opener()
+        .open_path(path.to_string_lossy(), None::<&str>)
+        .map_err(|error| error.to_string())?;
+    Ok(String::new())
+}
+
+#[tauri::command]
+fn show_library_in_folder(file_path: String, app: tauri::AppHandle) -> Result<Value, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = library_file(&app.state::<AppState>(), &file_path)?;
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({"ok": true}))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -1765,12 +1967,18 @@ pub fn run() {
                 .join("SmartEdu Textbook Library Lite");
             let settings_path = data_dir.join("settings.json");
             let queue_path = data_dir.join("queue.json");
-            let settings = fs::read_to_string(&settings_path)
+            let mut settings: AppSettings = fs::read_to_string(&settings_path)
                 .ok()
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_else(|| {
                     default_settings(default_download.to_string_lossy().into_owned())
                 });
+            settings.default_download_directory = default_download.to_string_lossy().into_owned();
+            settings.effective_download_directory = if settings.download_directory.is_empty() {
+                settings.default_download_directory.clone()
+            } else {
+                settings.download_directory.clone()
+            };
             let mut queue = fs::read_to_string(&queue_path)
                 .ok()
                 .and_then(|json| serde_json::from_str::<QueueState>(&json).ok())
@@ -1900,5 +2108,110 @@ mod tests {
             output_filename(&resource(), "{学科}_{短ID}.pdf"),
             "数学_abcdefgh.pdf"
         );
+    }
+    struct TestDirectory(std::path::PathBuf);
+    impl TestDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("lite-regression-{}", super::attempt_id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn state(&self) -> super::AppState {
+            super::AppState {
+                settings: std::sync::Mutex::new(super::default_settings(
+                    self.0.join("default").to_string_lossy().into_owned(),
+                )),
+                queue: std::sync::Mutex::new(super::idle_queue()),
+                queue_runtime: std::sync::Mutex::new(super::QueueRuntime::default()),
+                settings_path: self.0.join("settings.json"),
+                catalog_cache_path: self.0.join("catalog.json"),
+                library_path: self.0.join("library.json"),
+                queue_path: self.0.join("queue.json"),
+            }
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn old_attempt_cleanup_preserves_retry_and_completed_book() {
+        let dir = TestDirectory::new();
+        let old = dir.0.join(format!("book.{}.part", super::attempt_id()));
+        let retry = dir.0.join(format!("book.{}.part", super::attempt_id()));
+        let target = dir.0.join("book.pdf");
+        assert_ne!(old, retry);
+        std::fs::write(&old, b"old attempt").unwrap();
+        std::fs::write(&retry, b"new attempt").unwrap();
+        std::fs::write(&target, b"completed book").unwrap();
+        drop(super::AttemptFile(old.clone()));
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(retry).unwrap(), b"new attempt");
+        assert_eq!(std::fs::read(target).unwrap(), b"completed book");
+    }
+
+    #[test]
+    fn cached_downloaded_flag_is_cleared_when_library_file_is_gone() {
+        let dir = TestDirectory::new();
+        let mut book = resource();
+        book.local_state = "downloaded".into();
+        let mut books = vec![book];
+        super::mark_downloaded(&mut books, &dir.0.join("missing-library.json"));
+        assert_eq!(books[0].local_state, "not-downloaded");
+    }
+
+    #[test]
+    fn directory_selection_and_reset_persist_and_respect_active_worker() {
+        let dir = TestDirectory::new();
+        let state = dir.state();
+        let custom = dir.0.join("custom").to_string_lossy().into_owned();
+        let saved = super::save_download_directory(&state, custom.clone()).unwrap();
+        assert_eq!(saved.effective_download_directory, custom);
+        assert!(std::path::Path::new(&custom).is_dir());
+        let persisted: super::AppSettings =
+            serde_json::from_str(&std::fs::read_to_string(&state.settings_path).unwrap()).unwrap();
+        assert_eq!(persisted.download_directory, custom);
+        state.queue.lock().unwrap().status = "paused".into();
+        assert!(super::save_download_directory(&state, String::new()).is_err());
+        state.queue.lock().unwrap().status = "canceled".into();
+        state.queue_runtime.lock().unwrap().worker_active = true;
+        assert!(super::save_download_directory(&state, String::new()).is_err());
+        assert!(super::ensure_worker_stopped(&state).is_err());
+        state.queue_runtime.lock().unwrap().worker_active = false;
+        let reset = super::save_download_directory(&state, String::new()).unwrap();
+        assert!(reset.download_directory.is_empty());
+        assert_eq!(
+            reset.effective_download_directory,
+            reset.default_download_directory
+        );
+    }
+    #[test]
+    fn detail_link_does_not_hide_a_pdf_without_content_id() {
+        let text =
+            "https://basic.smartedu.cn/detail?contentId=book-id https://cdn.example/book.pdf";
+        assert_eq!(
+            find_pdf_url(text, "book-id").as_deref(),
+            Some("https://cdn.example/book.pdf")
+        );
+    }
+
+    #[test]
+    fn viewer_resolves_relative_pdf_and_rejects_unsafe_scheme() {
+        assert_eq!(
+            find_pdf_url(
+                "https://cdn.example/viewer.html?file=%2Fbooks%2Fbook.pdf",
+                "id"
+            )
+            .as_deref(),
+            Some("https://cdn.example/books/book.pdf")
+        );
+        assert!(find_pdf_url(
+            "https://cdn.example/viewer.html?file=javascript%3Aalert(1)",
+            "id"
+        )
+        .is_none());
     }
 }

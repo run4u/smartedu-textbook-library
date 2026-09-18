@@ -47,6 +47,9 @@ pub(super) async fn start_browser_download(
                     .add_WebResourceResponseReceived(
                         &WebResourceResponseReceivedEventHandler::create(Box::new(
                             move |_sender, args| {
+                                if !download_receiver_active(&finished_sender) {
+                                    return Ok(());
+                                }
                                 let Some(args) = args else {
                                     return Ok(());
                                 };
@@ -108,9 +111,11 @@ pub(super) async fn start_browser_download(
                                             let _ = sender.send(BrowserDownloadFinished {
                                                 path: None,
                                                 success: false,
-                                                error: Some(format!(
-                                                    "WebView2 请求 PDF 失败：HTTP {status}"
-                                                )),
+                                                error: Some(match status {
+                                                    401 => "平台登录已失效或授权信息无效（HTTP 401），请重新登录后重试".into(),
+                                                    403 => "平台拒绝访问该教材（HTTP 403），请确认账号权限后重试".into(),
+                                                    _ => format!("WebView2 请求 PDF 失败：HTTP {status}"),
+                                                }),
                                             });
                                         }
                                     }

@@ -1,6 +1,8 @@
 # Lite backend refactor
 
-Status (2026-09-17): in progress. A successful build is not authenticated download acceptance.
+Current status (2026-10-30): see [LITE-STATUS.md](LITE-STATUS.md) for the handover, build history and acceptance checklist. Windows CI passed for `c019fad` and `c716eca`; the former failed a real download test and the latter has no user retest result. A successful build is not authenticated download acceptance.
+
+The sections dated 2026-09-17 below are historical implementation notes; their local MSVC limitation does not imply that subsequent CI runs failed. Current packaging uses GitHub Actions rather than installing local C++ Build Tools.
 
 ## Implemented locally
 
@@ -33,7 +35,7 @@ Status (2026-09-17): in progress. A successful build is not authenticated downlo
   derived paths. Add Rust regressions for attempt isolation, cached flags, and
   directory persistence/reset while a worker is active.
 
-Validation on this workstation:
+Historical validation on this workstation (2026-09-17):
 
 - Existing Vitest suite: 35 passed; TypeScript check and production frontend build passed.
 - Rust formatting and git whitespace checks passed.
@@ -62,7 +64,9 @@ Validation on this workstation:
   (35), type check/build and Rust formatting passed. Rust tests remain blocked
   by missing MSVC link.exe; authenticated download and packaging remain unverified.
 
-## Required before a new acceptance package
+## Acceptance and follow-up work
+
+Some implementation items below are already present; their integration behavior still needs verification. Module extraction and completion notifications are later improvements, not prerequisites for producing a diagnostic test package.
 
 1. Prove a single WebView2 transport with authenticated requests, request identity,
    redirects, full response bytes, cancellation and progress. CDP is a candidate,

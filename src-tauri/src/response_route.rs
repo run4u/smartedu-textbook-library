@@ -1,5 +1,13 @@
 use reqwest::Url;
 
+// Diagnostic strings reach the renderer and queue.json. Keep signed URLs out.
+pub fn diagnostic_host(value: &str) -> String {
+    Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 pub struct ResponseRoute {
     expected: Url,
     redirects: u8,
@@ -68,5 +76,10 @@ mod tests {
         assert!(route.matches("https://cdn.example/object/123"));
         assert!(!route.matches("https://a.example/download?id=1"));
         assert!(route.redirect("http://cdn.example/object/123").is_err());
+    }
+    #[test]
+    fn diagnostic_does_not_include_credentials_path_or_signed_query() {
+        assert_eq!(diagnostic_host("https://user:fixture@cdn.example/private-token/book.pdf?signature=fixture-secret#page=2"), "cdn.example");
+        assert_eq!(diagnostic_host("not-a-url?token=fixture-secret"), "unknown");
     }
 }

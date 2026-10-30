@@ -76,9 +76,10 @@ pub(super) async fn start_browser_download(
                                 } else {
                                     String::new()
                                 };
+                                let host = response_route::diagnostic_host(&uri);
                                 if let Ok(mut observation) = response_observation.lock() {
                                     *observation = format!(
-                                        "URL: {uri}；HTTP {status}；Content-Type: {}",
+                                        "站点: {host}；HTTP {status}；Content-Type: {}",
                                         if content_type.is_empty() {
                                             "未提供"
                                         } else {
@@ -151,7 +152,7 @@ pub(super) async fn start_browser_download(
                                 let content_target = target.clone();
                                 let content_started = response_started.clone();
                                 let content_observation = response_observation.clone();
-                                let content_uri = uri.clone();
+                                let content_host = host.clone();
                                 let response_type = content_type.clone();
                                 let read_start = response.GetContent(
                                     &WebResourceResponseViewGetContentCompletedHandler::create(
@@ -200,7 +201,7 @@ pub(super) async fn start_browser_download(
                                                 file.flush().map_err(|error| error.to_string())?;
                                                 if !contains_pdf_header(&prefix) {
                                                     return Err(format!(
-                                                        "响应不是 PDF；URL: {content_uri}；Content-Type: {}；文件头: {}",
+                                                        "响应不是 PDF；站点: {content_host}；Content-Type: {}；文件头: {}",
                                                         if response_type.is_empty() {
                                                             "未提供"
                                                         } else {

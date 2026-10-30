@@ -16,7 +16,7 @@ function eventSubscription<T>(event: string, listener: (payload: T) => void): ()
 }
 
 const tauriBridge: TextbookBridge = {
-  appVersion: '0.1.3-alpha.1 Lite prototype',
+  appVersion: `0.1.3-alpha.1 Lite (${(import.meta.env.VITE_LITE_BUILD || 'local').slice(0, 7)})`,
   loadCatalog: () => invoke('load_catalog'),
   getSessionStatus: () => invoke('session_status'),
   login: () => invoke('open_login'),

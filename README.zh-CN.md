@@ -34,6 +34,8 @@ SmartEdu Textbook Library 是一个本地优先的桌面应用，用于查找、
 
 ## 当前状态
 
+本页功能以标准版为主。Lite 使用独立 Tauri/WebView2 后端，下载仍在优化和验收中，请先看 [Lite 进度与接手入口](docs/LITE-STATUS.md)。
+
 开发版已支持上述完整的目录、登录、下载队列和本地资料流程。项目可以在本地生成 Windows NSIS 安装版和便携版，但产物尚未签名，仍需完成 [测试指南](docs/TESTING.md) 中列出的剩余人工验收。
 
 Windows x64 `0.1.3-alpha.1` 安装版和便携版可从 [GitHub Releases](https://github.com/run4u/smartedu-textbook-library/releases/tag/v0.1.3-alpha.1) 下载。该测试版包含最新的设置和显示改进，安装包尚未进行代码签名，仍需补充扩展验收测试。

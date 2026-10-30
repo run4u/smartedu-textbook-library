@@ -25,61 +25,8 @@ use tauri::{
 
 const VERSION_URL: &str =
     "https://s-file-2.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json";
-const DETAIL_PROBE_SCRIPT: &str = r#"
-(() => {
-  const state = window.__smarteduLiteProbe = window.__smarteduLiteProbe || { auth: '', urls: [] };
-  const rememberUrl = (value) => {
-    try {
-      const url = typeof value === 'string' ? value : value && value.url;
-      if (url && !state.urls.includes(url)) state.urls.push(url);
-    } catch (_) {}
-  };
-  const rememberHeaders = (headers) => {
-    try {
-      new Headers(headers || {}).forEach((value, name) => {
-        if (name.toLowerCase() === 'x-nd-auth' && value) state.auth = value;
-      });
-    } catch (_) {}
-  };
-  const originalFetch = window.fetch;
-  if (originalFetch && !originalFetch.__smarteduLiteWrapped) {
-    const wrappedFetch = function(input, init) {
-      rememberUrl(input);
-      rememberHeaders(input && input.headers);
-      rememberHeaders(init && init.headers);
-      return originalFetch.apply(this, arguments).then((response) => {
-        rememberUrl(response && response.url);
-        return response;
-      });
-    };
-    wrappedFetch.__smarteduLiteWrapped = true;
-    window.fetch = wrappedFetch;
-  }
-  const originalOpen = XMLHttpRequest.prototype.open;
-  const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
-  XMLHttpRequest.prototype.open = function(method, url) {
-    rememberUrl(url);
-    return originalOpen.apply(this, arguments);
-  };
-  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
-    if (String(name).toLowerCase() === 'x-nd-auth' && value) state.auth = String(value);
-    return originalSetHeader.apply(this, arguments);
-  };
-})();
-"#;
-
-const READ_DETAIL_PROBE_SCRIPT: &str = r#"
-(() => {
-  const state = window.__smarteduLiteProbe || { auth: '', urls: [] };
-  const performanceUrls = performance.getEntriesByType('resource').map((entry) => entry.name);
-  return {
-    html: document.documentElement ? document.documentElement.outerHTML : '',
-    title: document.title || '',
-    auth: state.auth || '',
-    urls: Array.from(new Set([...(state.urls || []), ...performanceUrls]))
-  };
-})()
-"#;
+const DETAIL_PROBE_SCRIPT: &str = include_str!("../scripts/detail-probe.js");
+const READ_DETAIL_PROBE_SCRIPT: &str = include_str!("../scripts/read-detail-probe.js");
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -232,7 +179,8 @@ struct DetailProbe {
     html: String,
     #[serde(default)]
     title: String,
-    auth: String,
+    #[serde(default)]
+    requests: Vec<request_probe::ObservedRequest>,
     urls: Vec<String>,
 }
 
@@ -686,6 +634,7 @@ async fn read_detail_probe(window: &WebviewWindow) -> Result<DetailProbe, String
 async fn resolve_pdf(
     app: &tauri::AppHandle,
     resource: &TextbookResource,
+    task_id: &str,
     signal: &Arc<AtomicU8>,
     download_target: PathBuf,
 ) -> Result<
@@ -718,7 +667,7 @@ async fn resolve_pdf(
     )
     .title("正在解析教材详情")
     .visible(false)
-    .initialization_script(DETAIL_PROBE_SCRIPT)
+    .initialization_script_for_all_frames(DETAIL_PROBE_SCRIPT)
     // The platform can redirect textbook PDFs to CDN hosts outside the
     // login-domain allowlist. This hidden window only follows HTTPS URLs
     // discovered from the authenticated textbook detail page.
@@ -754,20 +703,25 @@ async fn resolve_pdf(
     let result = async {
         #[cfg(windows)]
         request_probe::install(&window, native_probe.clone()).await.map_err(DownloadFailure::Failed)?;
-        window.navigate(detail).map_err(|error| DownloadFailure::Failed(error.to_string()))?;
+        window.navigate(detail.clone()).map_err(|error| DownloadFailure::Failed(error.to_string()))?;
         let started = std::time::Instant::now();
-        let mut last_auth = String::new();
+        let mut candidate_wait = request_probe::CandidateWait::default();
         let mut last_url_count = 0;
         let mut saw_auth = false;
         let mut last_title = String::new();
         let mut shown = false;
         while started.elapsed() < Duration::from_secs(180) {
+            let directive = signal.load(Ordering::Relaxed);
+            if directive != DOWNLOAD_RUNNING {
+                return Err(DownloadFailure::Interrupted(directive));
+            }
             if !shown && started.elapsed() >= Duration::from_secs(15) {
                 window.set_title("请确认登录并打开教材阅读页面，识别后将自动继续下载")
                     .map_err(|error| DownloadFailure::Failed(error.to_string()))?;
                 window.show().map_err(|error| DownloadFailure::Failed(error.to_string()))?;
                 let _ = window.set_focus();
                 shown = true;
+                report_progress(app, task_id, "resolving", "请在弹出的教材详情窗口完成登录或阅读确认", None, None);
             }
             if app.get_webview_window(&label).is_none() {
                 return Err(DownloadFailure::Failed("教材详情窗口已关闭；请重试并完成平台登录或阅读确认".into()));
@@ -779,31 +733,28 @@ async fn resolve_pdf(
             }
             let probe = match read_detail_probe(&window).await {
                 Ok(value) => value,
-                Err(_) => DetailProbe { html: String::new(), title: String::new(), auth: String::new(), urls: Vec::new() },
+                Err(_) => DetailProbe { html: String::new(), title: String::new(), requests: Vec::new(), urls: Vec::new() },
             };
-            if !probe.auth.is_empty() { last_auth = probe.auth.clone(); }
             if !probe.title.is_empty() { last_title = probe.title.chars().take(80).collect(); }
-            saw_auth |= !last_auth.is_empty() || native_probe.lock().map(|probe| probe.has_auth()).unwrap_or(false);
+            saw_auth |= probe.requests.iter().any(|request| !request.auth.is_empty())
+                || native_probe.lock().map(|probe| probe.has_auth()).unwrap_or(false);
             let native_urls = native_probe.lock().map(|probe| probe.urls.clone()).unwrap_or_default();
-            last_url_count = probe.urls.len() + native_urls.len();
+            last_url_count = probe.urls.iter().chain(native_urls.iter()).collect::<std::collections::HashSet<_>>().len();
             let mut searchable = probe.html;
             searchable.push('\n');
             searchable.push_str(&probe.urls.join("\n"));
             searchable.push('\n');
             searchable.push_str(&native_urls.join("\n"));
             if let Some(pdf_url) = find_pdf_url(&searchable, &resource.content_id) {
-                let exact_auth = native_probe.lock().ok().and_then(|probe| probe.auth_for(&pdf_url));
-                // A viewer URL can appear before its authenticated fetch runs.
-                // Prefer the target request's header, including requests in frames.
-                if let Some(auth) = exact_auth { return Ok((pdf_url, auth)); }
-                if started.elapsed() >= Duration::from_secs(6) {
-                    // Windows uses only a header observed on this exact request.
-                    // Public/signed PDFs may legitimately use cookies without it.
-                    #[cfg(windows)]
-                    return Ok((pdf_url, String::new()));
-                    #[cfg(not(windows))]
-                    return Ok((pdf_url, last_auth.clone()));
+                let exact_auth = native_probe.lock().ok().and_then(|probe| probe.auth_for(&pdf_url))
+                    .or_else(|| request_probe::auth_for(&probe.requests, &pdf_url));
+                // Wait from discovery of this candidate, not from navigation.
+                // Headers from unrelated API requests must never authorize a PDF.
+                if candidate_wait.ready(&pdf_url, started.elapsed(), exact_auth.is_some()) {
+                    return Ok((pdf_url, exact_auth.unwrap_or_default()));
                 }
+            } else {
+                candidate_wait.clear();
             }
         }
         Err(DownloadFailure::Failed(format!(
@@ -1055,7 +1006,7 @@ async fn download_single(
         download_started,
         download_sender,
         response_observation,
-    ) = resolve_pdf(&app, &resource, &signal, part.clone()).await?;
+    ) = resolve_pdf(&app, &resource, &task_id, &signal, part.clone()).await?;
     let referer = detail_url(&resource)
         .map_err(DownloadFailure::Failed)?
         .to_string();

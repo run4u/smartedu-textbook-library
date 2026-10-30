@@ -15,3 +15,5 @@ downloads/
 *.part
 *.tmp
 ui-*.png
+
+.github-artifacts/

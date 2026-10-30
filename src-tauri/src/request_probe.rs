@@ -1,10 +1,55 @@
 use super::*;
 
 // In-memory only. Never persist authorization headers or signed resource URLs.
+#[derive(Clone, Deserialize)]
+pub(super) struct ObservedRequest {
+    pub url: String,
+    pub auth: String,
+}
+
+fn normalize_url(value: &str) -> Option<tauri::Url> {
+    let mut url = tauri::Url::parse(value).ok()?;
+    url.set_fragment(None);
+    Some(url)
+}
+
+pub(super) fn auth_for(requests: &[ObservedRequest], target: &str) -> Option<String> {
+    let target = normalize_url(target)?;
+    requests.iter().rev().find_map(|request| {
+        (!request.auth.is_empty() && normalize_url(&request.url).as_ref() == Some(&target))
+            .then(|| request.auth.clone())
+    })
+}
+
+#[derive(Default)]
+pub(super) struct CandidateWait {
+    current: Option<(String, Duration)>,
+}
+
+impl CandidateWait {
+    pub fn clear(&mut self) {
+        self.current = None;
+    }
+
+    pub fn ready(&mut self, url: &str, elapsed: Duration, authorized: bool) -> bool {
+        let url = normalize_url(url)
+            .map(|url| url.to_string())
+            .unwrap_or_else(|| url.into());
+        if self.current.as_ref().map(|(known, _)| known) != Some(&url) {
+            self.current = Some((url, elapsed));
+        }
+        authorized
+            || self
+                .current
+                .as_ref()
+                .is_some_and(|(_, seen)| elapsed.saturating_sub(*seen) >= Duration::from_secs(6))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RequestProbe {
     pub urls: Vec<String>,
-    headers: Vec<(String, String)>,
+    headers: Vec<ObservedRequest>,
 }
 
 impl RequestProbe {
@@ -13,6 +58,11 @@ impl RequestProbe {
     }
 
     pub fn remember(&mut self, url: String, auth: String) {
+        let Some(url) = normalize_url(&url).filter(|url| matches!(url.scheme(), "http" | "https"))
+        else {
+            return;
+        };
+        let url = url.to_string();
         if !self.urls.contains(&url) {
             if self.urls.len() >= 512 {
                 self.urls.remove(0);
@@ -20,22 +70,16 @@ impl RequestProbe {
             self.urls.push(url.clone());
         }
         if !auth.is_empty() {
-            self.headers.retain(|(known, _)| known != &url);
+            self.headers.retain(|request| request.url != url);
             if self.headers.len() >= 128 {
                 self.headers.remove(0);
             }
-            self.headers.push((url, auth));
+            self.headers.push(ObservedRequest { url, auth });
         }
     }
 
     pub fn auth_for(&self, target: &str) -> Option<String> {
-        let mut target = tauri::Url::parse(target).ok()?;
-        target.set_fragment(None);
-        self.headers.iter().rev().find_map(|(url, auth)| {
-            let mut url = tauri::Url::parse(url).ok()?;
-            url.set_fragment(None);
-            (url == target).then(|| auth.clone())
-        })
+        auth_for(&self.headers, target)
     }
 }
 
@@ -149,5 +193,28 @@ mod tests {
                 .as_deref(),
             Some("renewed")
         );
+    }
+    #[test]
+    fn late_pdf_discovery_gets_its_own_authorization_grace_period() {
+        let mut wait = CandidateWait::default();
+        let pdf = "https://cdn.example/late.pdf";
+        assert!(!wait.ready(pdf, Duration::from_secs(40), false));
+        assert!(!wait.ready(pdf, Duration::from_secs(45), false));
+        assert!(wait.ready(pdf, Duration::from_secs(46), false));
+    }
+
+    #[test]
+    fn changed_or_disappeared_candidate_resets_the_wait() {
+        let mut wait = CandidateWait::default();
+        assert!(!wait.ready("https://cdn.example/a.pdf", Duration::ZERO, false));
+        assert!(!wait.ready("https://cdn.example/b.pdf", Duration::from_secs(9), false));
+        assert!(wait.ready(
+            "https://cdn.example/b.pdf#page=2",
+            Duration::from_secs(15),
+            false
+        ));
+        wait.clear();
+        assert!(!wait.ready("https://cdn.example/b.pdf", Duration::from_secs(16), false));
+        assert!(wait.ready("https://cdn.example/b.pdf", Duration::from_secs(16), true));
     }
 }
